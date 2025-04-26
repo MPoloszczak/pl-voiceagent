@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  voiceagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pl-voiceagent
+    ports:
+      - "8080:8080"  
+    env_file:
+      - .env
+    environment:
+      PORT: 8080  # Changed port to 8080
+     
+    restart: unless-stopped
+    volumes:
+      # For persistent logs if needed
+      - ./logs:/app/logs
+
+    networks:
+      - voiceagent-network
+      
+  # Ngrok service with HTTPS enabled for Twilio compatibility
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    depends_on:
+      - voiceagent
+    env_file:
+      - .env
+    ports:
+      - "4040:4040"  # Expose ngrok web interface
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTH_TOKEN}
+    command:
+      - "http"
+      - "--log=stdout"
+      - "voiceagent:8080"  # Updated port to 8080
+    networks:
+      - voiceagent-network
+
+networks:
+  voiceagent-network:
+    driver: bridge 
