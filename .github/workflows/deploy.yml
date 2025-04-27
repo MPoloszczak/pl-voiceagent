@@ -1,0 +1,45 @@
+name: Deploy to ECR and ECS
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::140023383274:role/GitHubOIDCRoleName
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push Docker image
+        run: |
+          IMAGE_TAG=latest
+          REPOSITORY=pololabs-voiceagent-repo
+          REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          docker build -t $REPOSITORY:$IMAGE_TAG .
+          docker tag $REPOSITORY:$IMAGE_TAG $REGISTRY/$REPOSITORY:$IMAGE_TAG
+          docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+
+      - name: Deploy to ECS service
+        run: |
+          aws ecs update-service \
+            --cluster Pl-VoiceAgent \
+            --service pl-voiceagent-defFamily-service-413ed1xt \
+            --force-new-deployment 
