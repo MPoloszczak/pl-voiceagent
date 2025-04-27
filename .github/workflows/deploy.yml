@@ -21,7 +21,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
-          role-to-assume: arn:aws:iam::140023383274:role/GitHubOIDCRoleName
+          role-to-assume: arn:aws:iam::140023383274:role/Pololabs-VoiceAgent-Deploy-Role
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
@@ -30,7 +30,7 @@ jobs:
 
       - name: Build, tag, and push Docker image
         run: |
-          IMAGE_TAG=latest
+          IMAGE_TAG=prod
           REPOSITORY=pololabs-voiceagent-repo
           REGISTRY=${{ steps.login-ecr.outputs.registry }}
           docker build -t $REPOSITORY:$IMAGE_TAG .
