@@ -43,5 +43,5 @@ jobs:
         run: |
           aws ecs update-service \
             --cluster Pl-VoiceAgent \
-            --service pl-voiceagent-defFamily-service-413ed1xt \
+            --service pl-voiceagent-defFamily-service-di4igp5c \
             --force-new-deployment 
