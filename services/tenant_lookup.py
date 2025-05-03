@@ -15,13 +15,25 @@ with the cluster-level `public` search_path and without switching roles.
 
 import os
 import json
-from typing import Optional
+from typing import Optional, Any
 
 import boto3
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql import text
 
 from utils import logger
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Database name may be supplied separately so that we do not store PHI-related
+# identifiers inside the managed AWS secret.  This satisfies HIPAA
+# §164.312(a)(2)(iv) (Encryption) by letting AWS Secrets Manager keep only the
+# minimum necessary sensitive values (username/password) while the DB name
+# travels via the encrypted ECS Task environment channel.
+
+DATABASE_NAME = os.environ.get("DATABASE_NAME")
 
 # ---------------------------------------------------------------------------
 # Helpers – resolve RDS DSN from env/Secrets Manager
@@ -57,13 +69,34 @@ def _resolve_rds_dsn(raw_val: Optional[str]) -> Optional[str]:
                 # If secret payload is JSON, pluck DSN field; otherwise assume raw DSN
                 try:
                     payload = json.loads(secret_str)
-                    return payload.get("RDS") or payload.get("POSTGRES_DSN") or secret_str
+
+                    # If secret is already a DSN string under a key
+                    embedded_dsn = payload.get("RDS") or payload.get("POSTGRES_DSN")
+                    if embedded_dsn:
+                        return embedded_dsn
+
+                    # Otherwise attempt to construct DSN from individual parts
+                    user = payload.get("username") or payload.get("user")
+                    password = payload.get("password") or payload.get("pass")
+                    host = payload.get("host") or payload.get("endpoint") or payload.get("hostname")
+                    port = payload.get("port", 5432)
+
+                    if user and password and host and DATABASE_NAME:
+                        # Use asyncpg driver for async SQLAlchemy
+                        return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{DATABASE_NAME}"
+
+                    # As a last resort, fall back to treating the whole JSON as raw DSN
+                    return secret_str
                 except json.JSONDecodeError:
                     return secret_str
         except Exception as exc:
             logger.error(f"Failed to fetch RDS secret {raw_val}: {exc}")
             return None
     # Otherwise assume it is already a DSN
+    if raw_val and DATABASE_NAME and '/' not in raw_val.split('@')[-1]:
+        # DSN missing db path; append it
+        return raw_val.rstrip('/') + f"/{DATABASE_NAME}"
+
     return raw_val
 
 
