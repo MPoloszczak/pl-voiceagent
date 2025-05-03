@@ -40,64 +40,60 @@ DATABASE_NAME = os.environ.get("DATABASE_NAME")
 # ---------------------------------------------------------------------------
 
 
-def _resolve_rds_dsn(raw_val: Optional[str]) -> Optional[str]:
-    """Return a PostgreSQL DSN usable by SQLAlchemy.
+def _resolve_rds_dsn(secret_arn: Optional[str]) -> Optional[str]:
+    """Build a PostgreSQL DSN from *separate* environment variables and the
+    *RDS* secret that holds *only* the username & password.
 
-    The *raw_val* may be:
-      1. A direct DSN string (e.g. postgresql+asyncpg://user:pass@host/db)
-      2. An AWS Secrets Manager ARN whose payload is either that DSN directly
-         or a JSON document with a key named "RDS" or "POSTGRES_DSN".
+    Per the new deployment standard we keep non-PHI parameters (host, port,
+    database name) in **plain ECS task env vars** and store *only* the
+    credentials in AWS Secrets Manager.  This adheres to HIPAA
+    §164.312(a)(2)(iv) (Encryption of data at rest) while preventing any
+    unnecessary duplication of identifiers that could be linked back to an
+    individual (§164.514(b)).
 
-    For HIPAA §164.312(e)(1) Transmission Security, we avoid storing the DSN in
-    plain-text environment variables and instead reference a Secrets Manager
-    ARN.  This helper resolves the secret at runtime while the container
-    assumes the task IAM role that grants *GetSecretValue*.
+    Required env vars:
+        DATABASE_HOST   – cluster reader endpoint (read-only per compliance)
+        DATABASE_PORT   – port number (default 5432)
+        DATABASE_NAME   – DB name (non-PHI so safe in env var)
+
+    Required secret keys:
+        username / user
+        password / pass
     """
 
-    if not raw_val:
+    if not secret_arn:
+        logger.error("`RDS` environment variable missing – cannot build DSN")
         return None
 
-    # If the value looks like a Secrets Manager ARN, fetch it
-    if raw_val.startswith("arn:aws:secretsmanager"):
-        try:
-            region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
-            sm_client = boto3.client("secretsmanager", region_name=region)
-            resp = sm_client.get_secret_value(SecretId=raw_val)
-            secret_str: str = resp.get("SecretString", "")
+    # Fetch credentials from Secrets Manager
+    try:
+        region = "us-east-1"
+        sm_client = boto3.client("secretsmanager", region_name=region)
+        resp = sm_client.get_secret_value(SecretId=secret_arn)
+        secret_str: str = resp.get("SecretString", "")
+        payload = json.loads(secret_str) if secret_str else {}
 
-            if secret_str:
-                # If secret payload is JSON, pluck DSN field; otherwise assume raw DSN
-                try:
-                    payload = json.loads(secret_str)
+        user = payload.get("username") or payload.get("user")
+        password = payload.get("password") or payload.get("pass")
 
-                    # If secret is already a DSN string under a key
-                    embedded_dsn = payload.get("RDS") or payload.get("POSTGRES_DSN")
-                    if embedded_dsn:
-                        return embedded_dsn
-
-                    # Otherwise attempt to construct DSN from individual parts
-                    user = payload.get("username") or payload.get("user")
-                    password = payload.get("password") or payload.get("pass")
-                    host = payload.get("host") or payload.get("endpoint") or payload.get("hostname")
-                    port = payload.get("port", 5432)
-
-                    if user and password and host and DATABASE_NAME:
-                        # Use asyncpg driver for async SQLAlchemy
-                        return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{DATABASE_NAME}"
-
-                    # As a last resort, fall back to treating the whole JSON as raw DSN
-                    return secret_str
-                except json.JSONDecodeError:
-                    return secret_str
-        except Exception as exc:
-            logger.error(f"Failed to fetch RDS secret {raw_val}: {exc}")
+        if not (user and password):
+            logger.error("Secrets Manager payload missing username/password fields")
             return None
-    # Otherwise assume it is already a DSN
-    if raw_val and DATABASE_NAME and '/' not in raw_val.split('@')[-1]:
-        # DSN missing db path; append it
-        return raw_val.rstrip('/') + f"/{DATABASE_NAME}"
 
-    return raw_val
+        # Non-sensitive fields from env
+        host = os.environ.get("DATABASE_HOST")
+        port = int(os.environ.get("DATABASE_PORT", "5432"))
+        db_name = os.environ.get("DATABASE_NAME") or DATABASE_NAME
+
+        if not (host and db_name):
+            logger.error("DATABASE_HOST and/or DATABASE_NAME environment variables are missing – cannot build DSN")
+            return None
+
+        return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}"
+
+    except Exception as exc:
+        logger.error(f"Failed to fetch RDS secret {secret_arn}: {exc}")
+        return None
 
 
 RDS_DSN = _resolve_rds_dsn(os.environ.get("RDS"))

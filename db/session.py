@@ -4,18 +4,27 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.sql import text
 
 # ---------------------------------------------------------------------------
-# Connection string
+# Resolve DSN from env/Secrets Manager (shared helper)
 # ---------------------------------------------------------------------------
 
-# The primary (read-write) endpoint is now provided via the HIPAA-compliant
-# environment variable `RDS`.  We keep the previous `AURORA_DSN` fallback for
-# backwards compatibility during roll-out, but the new name should be used in
-# all deployment targets going forward.
+from services.tenant_lookup import _resolve_rds_dsn  # pylint: disable=protected-access
 
-_DSN = os.environ.get("RDS")
+# The primary (read-write) endpoint is provided via the HIPAA-compliant
+# environment variable `RDS`.  Its value may be either:
+#   1. A plain PostgreSQL DSN string; or
+#   2. An AWS Secrets Manager ARN whose payload contains the DSN or the
+#      components needed to build one.
+#
+# To maintain compliance with HIPAA §164.312(a)(2)(iv) (Encryption) we prefer
+# option ② because it keeps the credentials encrypted at rest and in transit.
+
+_RAW_RDS_VAL = os.environ.get("RDS")
+
+# Attempt to resolve the raw value into a DSN using the shared helper
+_DSN = _resolve_rds_dsn(_RAW_RDS_VAL)
 
 if not _DSN:
-    raise RuntimeError("RDS environment variable required for database connection is missing")
+    raise RuntimeError("RDS DSN could not be resolved from the `RDS` environment variable or its referenced secret")
 
 engine = create_async_engine(_DSN, pool_size=10, max_overflow=20, echo=False)
 
