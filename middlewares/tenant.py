@@ -28,7 +28,7 @@ class TenantCtx(BaseHTTPMiddleware):
         tenant_header = request.headers.get("x-tenant-id", "").strip().lower()
 
         if tenant_header:
-            tenant_name = tenant_header
+            tenant_name = tenant_header.split(".")[0]
         else:
             # Extract tenant from the hostname (e.g. clinicdev.pololabsai.com -> clinicdev)
             host_header = request.headers.get("host", "")
