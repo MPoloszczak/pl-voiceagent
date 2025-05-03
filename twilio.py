@@ -263,8 +263,10 @@ class TwilioService:
                                             send_silence_keepalive(websocket, stream_sid, session_id, tts_service)
                                         )
                                         
-                                        # Map call to tenant id for later DB/Redis lookups
-                                        self.call_to_tenant[call_sid] = websocket.headers.get("x-tenant-id", "default")
+                                        # Map call to tenant id for later DB/Redis lookups (derive from Host header)
+                                        host_header = websocket.headers.get("host", "")
+                                        tenant_part = host_header.split(":")[0].split(".")[0].lower() if host_header else "default"
+                                        self.call_to_tenant[call_sid] = tenant_part or "default"
                                         
                                         # Ensure Redis history key exists
                                         history_key = f"{self.call_to_tenant[call_sid]}:hist:{call_sid}"
@@ -304,8 +306,10 @@ class TwilioService:
                                             send_silence_keepalive(websocket, stream_sid, session_id, tts_service)
                                         )
                                         
-                                        # Map call to tenant id for later DB/Redis lookups
-                                        self.call_to_tenant[call_sid] = websocket.headers.get("x-tenant-id", "default")
+                                        # Map call to tenant id for later DB/Redis lookups (derive from Host header)
+                                        host_header = websocket.headers.get("host", "")
+                                        tenant_part = host_header.split(":")[0].split(".")[0].lower() if host_header else "default"
+                                        self.call_to_tenant[call_sid] = tenant_part or "default"
                                         
                                         # Exit the loop now that we have CallSid
                                         break
