@@ -4,7 +4,7 @@ from __future__ import annotations
 
 Provides read-only resolution of tenant name ➜ uuid mapping from the shared metadata
 schema in the Aurora PostgreSQL cluster.  All traffic is encrypted in-transit
-(TLS) and the database credentials are obtained via the `AURORA_DSN` environment
+(TLS) and the database credentials are obtained via the `RDS` environment
 variable which points to the *read-only* instance ARN per HIPAA §164.312(e)(1)
 Transmission Security.
 
@@ -25,11 +25,11 @@ from utils import logger
 # Engine (read-only)
 # ---------------------------------------------------------------------------
 
-RDS = os.environ.get("AURORA_DSN_RO") or os.environ.get("AURORA_DSN")
-if not RDS:
-    logger.warning("AURORA_DSN/AURORA_DSN_RO env var missing – tenant lookup will fail")
+RDS_DSN = os.environ.get("RDS")
+if not RDS_DSN:
+    logger.error("RDS env var missing – tenant lookup will fail")
 
-_engine = create_async_engine(RDS, pool_size=2, max_overflow=4, echo=False)
+_engine = create_async_engine(RDS_DSN, pool_size=2, max_overflow=4, echo=False)
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -47,11 +47,11 @@ async def _cached_lookup(name: str) -> Optional[str]:
         # Explicitly set search_path to public to avoid tenant schemas
         await conn.execute(text("SET search_path TO public"))
         result = await conn.execute(
-            text("SELECT id FROM tenants WHERE name = :name LIMIT 1"),
+            text("SELECT tenant_id FROM public.tenants WHERE name = :name LIMIT 1"),
             {"name": name},
         )
         row = result.fetchone()
-        uuid_val = row[0] if row else None
+        uuid_val = str(row[0]) if row else None
         if uuid_val:
             _TENANT_CACHE[name] = uuid_val
         return uuid_val

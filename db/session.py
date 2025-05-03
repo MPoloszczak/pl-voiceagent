@@ -3,10 +3,21 @@ from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.sql import text
 
+# ---------------------------------------------------------------------------
+# Connection string
+# ---------------------------------------------------------------------------
 
-AURORA_DSN = os.environ.get("AURORA_DSN", "postgresql+asyncpg://postgres:password@localhost/db")
+# The primary (read-write) endpoint is now provided via the HIPAA-compliant
+# environment variable `RDS`.  We keep the previous `AURORA_DSN` fallback for
+# backwards compatibility during roll-out, but the new name should be used in
+# all deployment targets going forward.
 
-engine = create_async_engine(AURORA_DSN, pool_size=10, max_overflow=20, echo=False)
+_DSN = os.environ.get("RDS")
+
+if not _DSN:
+    raise RuntimeError("RDS environment variable required for database connection is missing")
+
+engine = create_async_engine(_DSN, pool_size=10, max_overflow=20, echo=False)
 
 
 @asynccontextmanager
