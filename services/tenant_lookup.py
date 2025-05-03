@@ -14,22 +14,66 @@ with the cluster-level `public` search_path and without switching roles.
 """
 
 import os
+import json
 from typing import Optional
 
+import boto3
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql import text
 
 from utils import logger
 
 # ---------------------------------------------------------------------------
-# Engine (read-only)
+# Helpers – resolve RDS DSN from env/Secrets Manager
 # ---------------------------------------------------------------------------
 
-RDS_DSN = os.environ.get("RDS")
-if not RDS_DSN:
-    logger.error("RDS env var missing – tenant lookup will fail")
 
-_engine = create_async_engine(RDS_DSN, pool_size=2, max_overflow=4, echo=False)
+def _resolve_rds_dsn(raw_val: Optional[str]) -> Optional[str]:
+    """Return a PostgreSQL DSN usable by SQLAlchemy.
+
+    The *raw_val* may be:
+      1. A direct DSN string (e.g. postgresql+asyncpg://user:pass@host/db)
+      2. An AWS Secrets Manager ARN whose payload is either that DSN directly
+         or a JSON document with a key named "RDS" or "POSTGRES_DSN".
+
+    For HIPAA §164.312(e)(1) Transmission Security, we avoid storing the DSN in
+    plain-text environment variables and instead reference a Secrets Manager
+    ARN.  This helper resolves the secret at runtime while the container
+    assumes the task IAM role that grants *GetSecretValue*.
+    """
+
+    if not raw_val:
+        return None
+
+    # If the value looks like a Secrets Manager ARN, fetch it
+    if raw_val.startswith("arn:aws:secretsmanager"):
+        try:
+            region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+            sm_client = boto3.client("secretsmanager", region_name=region)
+            resp = sm_client.get_secret_value(SecretId=raw_val)
+            secret_str: str = resp.get("SecretString", "")
+
+            if secret_str:
+                # If secret payload is JSON, pluck DSN field; otherwise assume raw DSN
+                try:
+                    payload = json.loads(secret_str)
+                    return payload.get("RDS") or payload.get("POSTGRES_DSN") or secret_str
+                except json.JSONDecodeError:
+                    return secret_str
+        except Exception as exc:
+            logger.error(f"Failed to fetch RDS secret {raw_val}: {exc}")
+            return None
+    # Otherwise assume it is already a DSN
+    return raw_val
+
+
+RDS_DSN = _resolve_rds_dsn(os.environ.get("RDS"))
+
+if not RDS_DSN:
+    # This will bubble up later when the first lookup occurs; log loudly.
+    logger.error("RDS DSN could not be resolved – tenant lookup will fail")
+
+_engine = create_async_engine(RDS_DSN, pool_size=2, max_overflow=4, echo=False) if RDS_DSN else None
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -43,6 +87,14 @@ async def _cached_lookup(name: str) -> Optional[str]:
     """Internal helper with naive cache to reduce round-trips."""
     if name in _TENANT_CACHE:
         return _TENANT_CACHE[name]
+
+    global _engine  # we may recreate if was None
+    if _engine is None and RDS_DSN:
+        _engine = create_async_engine(RDS_DSN, pool_size=2, max_overflow=4, echo=False)
+    if _engine is None:
+        logger.error("Tenant lookup attempted without valid database DSN")
+        return None
+
     async with _engine.begin() as conn:
         # Explicitly set search_path to public to avoid tenant schemas
         await conn.execute(text("SET search_path TO public"))
