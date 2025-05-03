@@ -1,11 +1,21 @@
-import os
-import json
+import os, json
 import redis.asyncio as redis
 from typing import Any
+from utils import logger
 
 
-# Create Redis client using URL provided in env var
-redis_client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"), decode_responses=True)
+redis_url = os.environ.get("REDIS")
+if not redis_url:
+    logger.error("REDIS environment variable is missing – cannot start cache client")
+    raise RuntimeError("REDIS required for Redis connection")
+
+# When using ElastiCache in-transit encryption, the scheme should be 'rediss://'
+redis_client = redis.from_url(
+    redis_url,
+    decode_responses=True,
+    ssl=True,
+    ssl_cert_reqs=None  # or a CA bundle if you want cert verification
+)
 
 
 async def set_json(key: str, obj: Any, ttl: int = 900):
