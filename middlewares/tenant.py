@@ -22,14 +22,22 @@ class TenantCtx(BaseHTTPMiddleware):
             request.state.tenant_id = "default"
             return await call_next(request)
 
-        # Extract tenant from the hostname (e.g. clinicdev.pololabsai.com -> clinicdev)
-        host_header = request.headers.get("host", "")
-        hostname = host_header.split(":")[0]  # strip port if present
-        subdomain_parts = hostname.split(".")
-        if len(subdomain_parts) < 3:  # Expect at least subdomain + root domain
-            return JSONResponse({"detail": "invalid host header, tenant subdomain missing"}, status_code=400)
+        # Prefer explicit X-Tenant-Id header set by API Gateway mapping – this avoids
+        # brittle Host header rewrites that can occur with ALB/CloudFront.  When the
+        # header is missing we fall back to sub-domain extraction for local/dev use.
+        tenant_header = request.headers.get("x-tenant-id", "").strip().lower()
 
-        tenant_name = subdomain_parts[0].lower()
+        if tenant_header:
+            tenant_name = tenant_header
+        else:
+            # Extract tenant from the hostname (e.g. clinicdev.pololabsai.com -> clinicdev)
+            host_header = request.headers.get("host", "")
+            hostname = host_header.split(":")[0]  # strip port if present
+            subdomain_parts = hostname.split(".")
+            if len(subdomain_parts) < 3:  # Expect at least subdomain + root domain
+                return JSONResponse({"detail": "invalid host header, tenant subdomain missing"}, status_code=400)
+
+            tenant_name = subdomain_parts[0].lower()
 
         # Validate tenant against RDS mapping table (read-only query)
         try:
