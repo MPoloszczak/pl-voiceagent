@@ -80,16 +80,46 @@ def _resolve_rds_dsn(secret_arn: Optional[str]) -> Optional[str]:
             logger.error("Secrets Manager payload missing username/password fields")
             return None
 
-        # Non-sensitive fields from env
-        host = os.environ.get("DATABASE_HOST")
-        port = int(os.environ.get("DATABASE_PORT", "5432"))
+        # ------------------------------------------------------------------
+        # Resolve non-sensitive host / port variables.  They MAY come from:
+        #   • plain environment variables (preferred)
+        #   • an inadvertently mapped JSON blob (Secrets Manager payload)
+        # The latter has caused outages before, so we defensively parse.
+        # Per HIPAA §164.312(b) we avoid logging credentials or PHI.
+        # ------------------------------------------------------------------
+
+        def _extract_env_value(raw_val: str | None, key: str) -> str | None:
+            """Return *key* from *raw_val* which may already be the value or a JSON object string."""
+            if not raw_val:
+                return None
+            raw_val = raw_val.strip()
+            if raw_val.startswith("{"):
+                try:
+                    payload_json = json.loads(raw_val)
+                    return payload_json.get(key)
+                except json.JSONDecodeError:
+                    # Fall through – treat as plain string
+                    pass
+            return raw_val
+
+        host = _extract_env_value(os.environ.get("DATABASE_HOST"), "DATABASE_HOST")
+        port_raw = _extract_env_value(os.environ.get("DATABASE_PORT"), "DATABASE_PORT") or "5432"
+
+        try:
+            port = int(port_raw)
+        except ValueError:
+            logger.error("Malformed DATABASE_PORT value provided – expected integer, got %s", port_raw)
+            return None
+
         db_name = os.environ.get("DATABASE_NAME") or DATABASE_NAME
 
         if not (host and db_name):
-            logger.error("DATABASE_HOST and/or DATABASE_NAME environment variables are missing – cannot build DSN")
+            logger.error("DATABASE_HOST (%s) and/or DATABASE_NAME (%s) missing – cannot build DSN", bool(host), bool(db_name))
             return None
 
-        return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}"
+        dsn = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}"
+        logger.info("Built RDS DSN for DB %s at host %s:%s (credentials redacted)", db_name, host, port)
+        return dsn
 
     except Exception as exc:
         logger.error(f"Failed to fetch RDS secret {secret_arn}: {exc}")

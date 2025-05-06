@@ -2,7 +2,8 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from services.tenant_lookup import get_tenant_uuid  # NEW
+from utils import logger
+from services.tenant_lookup import get_tenant_uuid  
 
 
 class TenantCtx(BaseHTTPMiddleware):
@@ -17,6 +18,8 @@ class TenantCtx(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
 
+        logger.debug("Incoming request path: %s", path)
+
         # Allow unauthenticated access for health checks so the ALB can probe (§164.312(b)).
         if path in ("/", "/health", "/hc"):
             request.state.tenant_id = "default"
@@ -28,30 +31,37 @@ class TenantCtx(BaseHTTPMiddleware):
         tenant_header = request.headers.get("x-tenant-id", "").strip().lower()
 
         if tenant_header:
+            logger.debug("Tenant header provided: %s", tenant_header)
             tenant_name = tenant_header.split(".")[0]
         else:
             # Extract tenant from the hostname (e.g. clinicdev.pololabsai.com -> clinicdev)
             host_header = request.headers.get("host", "")
             hostname = host_header.split(":")[0]  # strip port if present
             subdomain_parts = hostname.split(".")
+            logger.debug("Derived subdomain parts from host header: %s", subdomain_parts)
             if len(subdomain_parts) < 3:  # Expect at least subdomain + root domain
                 return JSONResponse({"detail": "invalid host header, tenant subdomain missing"}, status_code=400)
 
             tenant_name = subdomain_parts[0].lower()
 
         # Validate tenant against RDS mapping table (read-only query)
+        logger.info("Resolving tenant '%s'", tenant_name)
         try:
             tenant_uuid = await get_tenant_uuid(tenant_name)
         except Exception as exc:
-            # Log but avoid leaking internal details to client
+            # Log internal failure generically – no PHI
+            logger.error("Tenant resolution exception for '%s': %s", tenant_name, exc)
             return JSONResponse({"detail": "internal tenant resolution error"}, status_code=500)
 
         if not tenant_uuid:
+            logger.info("Tenant '%s' not found", tenant_name)
             return JSONResponse({"detail": "unknown tenant"}, status_code=400)
 
         # Stash identifiers for downstream handlers
         request.state.tenant_id = tenant_name
         request.state.tenant_uuid = tenant_uuid
+
+        logger.debug("Tenant context set – id: %s uuid: %s", tenant_name, tenant_uuid)
 
         response = await call_next(request)
         return response 
