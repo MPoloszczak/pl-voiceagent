@@ -8,6 +8,7 @@ from starlette.websockets import WebSocketState
 import requests
 import base64
 from typing import Dict
+import sys
 
 # Configure logging
 def setup_logging(app_name="pl-voiceagent"):
@@ -27,15 +28,15 @@ def setup_logging(app_name="pl-voiceagent"):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        stream=sys.stdout,
     )
     
     # Set up logger
     logger = logging.getLogger(app_name)
     
-    # Set file handler for persistent logging
-    file_handler = logging.FileHandler(f"logs/{app_name}.log")
-    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    logger.addHandler(file_handler)
+    # Ensure we do not propagate messages to the root logger multiple times when
+    # setup_logging() is called in interactive contexts.
+    logger.propagate = False
     
     return logger
 
