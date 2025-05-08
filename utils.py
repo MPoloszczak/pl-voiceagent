@@ -24,18 +24,18 @@ def setup_logging(app_name="pl-voiceagent"):
     # Create logs directory if it doesn't exist
     os.makedirs("logs", exist_ok=True)
     
-    # Configure basic logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        stream=sys.stdout,
-    )
-    
-    # Set up logger
+    # Initialize named logger
     logger = logging.getLogger(app_name)
-    
-    # Ensure we do not propagate messages to the root logger multiple times when
-    # setup_logging() is called in interactive contexts.
+    logger.setLevel(logging.INFO)
+
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        logger.addHandler(handler)
+
+    # Prevent duplicate log propagation to the root logger
     logger.propagate = False
     
     return logger
