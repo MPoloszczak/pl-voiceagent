@@ -42,6 +42,7 @@ def setup_logging(app_name="pl-voiceagent"):
 
 # Initialize logger
 logger = setup_logging()
+logger.info("Logger initialized")
 
 async def send_periodic_pings(websocket, session_id, interval=25):
     """
