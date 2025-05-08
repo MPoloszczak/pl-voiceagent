@@ -39,15 +39,6 @@ async def startup_event():
     if not openai_api_key:
         logger.error("OPENAI_API_KEY is missing. Agent responses will not work.")
     
-    # Check for ngrok URL
-    ngrok_url = get_ngrok_url()
-    if ngrok_url:
-        # Log the important URLs for Twilio configuration
-        logger.info("======================= TWILIO CONFIGURATION URLS =======================")
-        logger.info(f"NGROK HTTPS URL: {ngrok_url}")
-        logger.info(f"Twilio Voice Webhook URL: {ngrok_url}/voice")
-        logger.info(f"Twilio WebSocket Stream URL: {ngrok_url}/twilio-stream")
-        logger.info("======================================================================")
 
 @app.on_event("shutdown")
 async def shutdown_event():

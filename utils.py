@@ -21,8 +21,6 @@ def setup_logging(app_name="pl-voiceagent"):
     Returns:
         The configured logger
     """
-    # Create logs directory if it doesn't exist
-    os.makedirs("logs", exist_ok=True)
     
     # Initialize named logger
     logger = logging.getLogger(app_name)
@@ -88,49 +86,6 @@ TWIML_STREAM_TEMPLATE = """
 </Response>
 """
 
-def get_ngrok_url():
-    """
-    Get the ngrok public URL from the ngrok API or environment.
-    
-    Returns:
-        str: The ngrok public URL or empty string if not found
-    """
-    ngrok_url = os.environ.get("NGROK_URL", "")
-    
-    if not ngrok_url:
-        try:
-            # Try to get the URL from ngrok's API
-            # Wait briefly to ensure ngrok is up
-            time.sleep(2)
-            
-            # Try to get the URL from ngrok's API
-            response = requests.get("http://ngrok:4040/api/tunnels", timeout=5)
-            tunnels = response.json().get("tunnels", [])
-            
-            if tunnels:
-                # Find the HTTPS tunnel
-                https_tunnels = [t for t in tunnels if t["public_url"].startswith("https://")]
-                if https_tunnels:
-                    ngrok_url = https_tunnels[0]["public_url"]
-                    os.environ["NGROK_URL"] = ngrok_url
-                    
-                    # Log the important URLs for Twilio configuration
-                    logger.info("======================= TWILIO CONFIGURATION URLS =======================")
-                    logger.info(f"NGROK HTTPS URL: {ngrok_url}")
-                    logger.info(f"Twilio Voice Webhook URL: {ngrok_url}/voice")
-                    logger.info(f"Twilio WebSocket Stream URL: {ngrok_url}/twilio-stream")
-                    logger.info("======================================================================")
-                else:
-                    logger.warning("No HTTPS ngrok tunnels found. Make sure --https=true is set in ngrok command.")
-                    ngrok_url = tunnels[0]["public_url"]
-                    logger.info(f"Using HTTP ngrok URL instead: {ngrok_url}")
-            else:
-                logger.warning("No ngrok tunnels found. Check ngrok container status.")
-        except Exception as e:
-            logger.error(f"Failed to get ngrok URL: {str(e)}")
-            logger.info("If using ngrok, please check the ngrok container logs for the public URL.")
-    
-    return ngrok_url 
 
 # Constants for keep-alive mechanism
 KEEPALIVE_INTERVAL = 5.0  # seconds between silence packets (must be < 10s)
