@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, WebSocket
 from aws_xray_sdk.core import patch_all
 from middlewares.tenant import TenantCtx
 
-from utils import logger, setup_logging, get_ngrok_url
+from utils import logger, setup_logging
 from twilio import twilio_service
 from dpg import get_deepgram_service
 from ell import tts_service
@@ -68,8 +68,6 @@ async def websocket_metrics():
 @app.get("/websocket-status")
 async def websocket_status():
     """Return detailed status about active WebSocket connections and connection attempts."""
-    ngrok_url = get_ngrok_url()
-    
     return {
         "active_connections_count": len(twilio_service.active_connections),
         "active_connections": [
@@ -80,8 +78,7 @@ async def websocket_status():
             }
             for session_id, ws in twilio_service.active_connections.items()
         ],
-        "connection_attempts": twilio_service.websocket_connection_attempts,
-        "ngrok_url": ngrok_url
+        "connection_attempts": twilio_service.websocket_connection_attempts
     }
 
 @app.post("/voice")
@@ -121,7 +118,7 @@ if __name__ == "__main__":
     # Disable reload in production, enable it only in development
     reload_mode = os.environ.get("ENV", "production").lower() == "development"
     
-    # Start the server (no SSL - ngrok handles HTTPS)
+    # Start the server
     logger.info(f"Starting server on port {port}")
     uvicorn.run(
         "main:app", 

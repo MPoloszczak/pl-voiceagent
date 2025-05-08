@@ -10,7 +10,7 @@ from starlette.websockets import WebSocketState
 import base64
 from collections import deque
 
-from utils import logger, TWIML_STREAM_TEMPLATE, get_ngrok_url, send_periodic_pings, send_silence_keepalive, cancel_keepalive_if_needed
+from utils import logger, TWIML_STREAM_TEMPLATE, send_periodic_pings, send_silence_keepalive, cancel_keepalive_if_needed
 from dpg import get_deepgram_service
 from ell import tts_service
 from oai import stream_agent_deltas
@@ -82,28 +82,18 @@ class TwilioService:
         except Exception as e:
             logger.warning(f"Could not log Twilio parameters: {str(e)}")
         
-        # Generate WebSocket URL - prioritize ngrok HTTPS URL if available
-        ngrok_url = get_ngrok_url()
-        
-        if ngrok_url and ngrok_url.startswith("https://"):
-            # Use the ngrok HTTPS URL which has valid certificates
-            websocket_url = f"{ngrok_url.replace('https://', 'wss://')}/twilio-stream"
-            logger.info(f"Using ngrok HTTPS URL for WebSocket: {websocket_url}")
-        else:
-            # Fallback to request-based URL determination
-            host = request.headers.get("host", "localhost:8080")
-            scheme = request.headers.get("x-forwarded-proto", "http")
-            
-            logger.info(f"🔍 Request headers: {dict(request.headers)}")
-            logger.info(f"🔍 Detected host: {host}, scheme: {scheme}")
-            
-            websocket_url = f"wss://{host}/twilio-stream"
-            if scheme == "http" and "localhost" in host:
-                # Only use ws:// for local development
-                websocket_url = f"ws://{host}/twilio-stream"
-            
-            logger.info(f"Using request-based WebSocket URL: {websocket_url}")
-        
+        # Generate WebSocket URL for Twilio streaming
+        host = request.headers.get("host", "localhost:8080")
+        scheme = request.headers.get("x-forwarded-proto", "http")
+
+        logger.info(f"🔍 Request headers: {dict(request.headers)}")
+        logger.info(f"🔍 Detected host: {host}, scheme: {scheme}")
+
+        websocket_url = f"wss://{host}/twilio-stream"
+        if scheme == "http" and "localhost" in host:
+            # Only use ws:// for local development
+            websocket_url = f"ws://{host}/twilio-stream"
+
         logger.info(f"🔍 Generated WebSocket URL: {websocket_url}")
         
         # Store CallSid in a pending connections dictionary to associate it later
