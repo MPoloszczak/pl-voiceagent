@@ -1,2 +1,18 @@
 .env
 rundown.md
+docker-compose.yml
+docker-compose.override.yml
+logs/
+
+# Python artefacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# macOS system files
+.DS_Store
+
+# Editor configs (optional – comment out if you want tracked)
+*.vscode/

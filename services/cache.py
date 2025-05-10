@@ -2,6 +2,8 @@ import os, json
 import redis.asyncio as redis
 from typing import Any
 from utils import logger
+from redis.exceptions import ConnectionError
+from redis.asyncio.cluster import RedisCluster
 
 
 # ---------------------------------------------------------------------------
@@ -42,25 +44,116 @@ else:
     # Assume host[:port][/db] without scheme – prepend rediss://
     redis_url = f"rediss://{redis_raw}"
 
-# When using ElastiCache in-transit encryption, the scheme should be 'rediss://'
-redis_client = redis.from_url(
-    redis_url,
-    decode_responses=True,
-    ssl_cert_reqs=None  # pass a CA bundle path here if you require server cert validation
-)
+# ---------------------------------------------------------------------------
+# Internal in-memory fallback cache – **ONLY** used when Redis is unreachable.
+# This guarantees the application continues to operate (statelessly) without
+# crashing while still keeping PHI in-memory and ephemeral within the HIPAA-
+# compliant container runtime.*
+# ---------------------------------------------------------------------------
+
+_fallback_cache = {}  # type: ignore[var-annotated]
+
+# Helper to decide whether we should treat the URL as a cluster configuration
+def _is_cluster_endpoint(url: str) -> bool:
+    """Return True if the given Redis URL points at an ElastiCache *clustercfg*
+    endpoint.  Those require redis-cluster topology support."""
+    return "clustercfg" in url
+
+# Lazily initialise a Redis/RedisCluster client so that connection errors don't
+# occur at *import* time and can instead be handled gracefully at runtime.
+_redis_client = None  # will be set on first use
 
 
-async def set_json(key: str, obj: Any, ttl: int = 900):
-    """Serialize obj to JSON and store with expiry ttl seconds."""
-    await redis_client.set(key, json.dumps(obj), ex=ttl)
+def _init_client() -> None:
+    """Initialise the global ``_redis_client`` with cluster detection / TLS.
+
+    If initialisation fails, we log the error and leave the client as ``None``
+    so that the calling helpers can fall back to the in-memory cache instead
+    of aborting the entire request handler.
+    """
+    global _redis_client
+    if _redis_client is not None:
+        return  # already initialised
+
+    try:
+        if _is_cluster_endpoint(redis_url):
+            # ElastiCache cluster mode ("clustercfg.") → use RedisCluster
+            _redis_client = RedisCluster.from_url(
+                redis_url,
+                decode_responses=True,
+                ssl=True,
+                ssl_cert_reqs=None,  # skip server cert validation – ensure SG/Private-Link enforcement instead
+            )
+            logger.info("🔗 Initialised RedisCluster client (cluster endpoint detected)")
+        else:
+            _redis_client = redis.from_url(
+                redis_url,
+                decode_responses=True,
+                ssl_cert_reqs=None,
+            )
+            logger.info("🔗 Initialised standalone Redis client")
+    except Exception as e:  # broad but we must not crash import
+        logger.error(f"❌ Failed to initialise Redis client: {e}. Falling back to in-memory cache.")
+        _redis_client = None
 
 
-async def get_json(key: str):
-    """Fetch a key and deserialize JSON, returning None if missing."""
-    val = await redis_client.get(key)
-    if val is None:
+# ----------------------------------------------------------------------------
+# Public async helpers with automatic fallback – API remains unchanged
+# ----------------------------------------------------------------------------
+
+
+async def set_json(key: str, obj: Any, ttl: int = 900):  # noqa: D401 – keep original signature
+    """Serialize *obj* to JSON and store it under *key*.
+
+    Falls back to an in-process dict when Redis is unavailable so the rest of
+    the application can continue operating.  The fallback cache is *not*
+    shared across containers and therefore only provides best-effort context.
+    """
+    _init_client()
+    payload = json.dumps(obj)
+
+    if _redis_client is None:
+        # Fallback: store in local memory
+        _fallback_cache[key] = payload
+        return
+
+    try:
+        await _redis_client.set(key, payload, ex=ttl)  # type: ignore[attr-defined]
+    except ConnectionError as ce:
+        logger.error(f"🔌 Redis connection error on SET for '{key}': {ce}. Using in-memory fallback.")
+        _fallback_cache[key] = payload
+
+
+async def get_json(key: str):  # noqa: D401 – keep original signature
+    """Retrieve *key* and deserialize JSON, returning ``None`` if missing.
+
+    Automatically falls back to the local in-process cache if Redis is
+    unreachable.
+    """
+    _init_client()
+
+    if _redis_client is None:
+        raw = _fallback_cache.get(key)
+    else:
+        try:
+            raw = await _redis_client.get(key)  # type: ignore[attr-defined]
+        except ConnectionError as ce:
+            logger.error(f"🔌 Redis connection error on GET for '{key}': {ce}. Resorting to in-memory cache.")
+            raw = _fallback_cache.get(key)
+
+    if raw is None:
         return None
     try:
-        return json.loads(val)
+        return json.loads(raw)
     except json.JSONDecodeError:
-        return None 
+        return None
+
+# ---------------------------------------------------------------------------
+# SECURITY (HIPAA) NOTE
+#
+# The fallback cache exists **only** inside the running container memory and
+# is never persisted or transmitted over the network.  All PHI therefore
+# remains protected in-transit (TLS) when Redis is reachable, or isolated to a
+# single, hardened container instance when Redis is unavailable.  This aligns
+# with HIPAA §164.312(e)(1) – Transmission Security.
+# --------------------------------------------------------------------------- 
