@@ -6,14 +6,6 @@ from redis.exceptions import ConnectionError
 from redis.asyncio.cluster import RedisCluster
 
 
-# ---------------------------------------------------------------------------
-# Resolve Redis URL – handles three scenarios:
-#   1) Secret injected as plain host:port (e.g. "cache.example.com:6379")
-#   2) Secret injected as full URI      (e.g. "rediss://cache.example.com:6379/0")
-#   3) Secret injected as JSON payload  (because the entire Secrets Manager JSON
-#      was mapped to the env var).  We inspect keys "REDIS_URL" or "REDIS".
-# ---------------------------------------------------------------------------
-
 _raw_env_val = os.environ.get("REDIS")
 
 if not _raw_env_val:
@@ -44,12 +36,7 @@ else:
     # Assume host[:port][/db] without scheme – prepend rediss://
     redis_url = f"rediss://{redis_raw}"
 
-# ---------------------------------------------------------------------------
-# Internal in-memory fallback cache – **ONLY** used when Redis is unreachable.
-# This guarantees the application continues to operate (statelessly) without
-# crashing while still keeping PHI in-memory and ephemeral within the HIPAA-
-# compliant container runtime.*
-# ---------------------------------------------------------------------------
+
 
 _fallback_cache = {}  # type: ignore[var-annotated]
 
@@ -113,15 +100,34 @@ async def set_json(key: str, obj: Any, ttl: int = 900):  # noqa: D401 – keep o
     payload = json.dumps(obj)
 
     if _redis_client is None:
-        # Fallback: store in local memory
+        # Redis unavailable – log at ERROR level and raise so upstream can react.
+        logger.error(
+            "❌ Redis client not initialised – cannot persist key '%s'. Falling back to in-memory cache.",
+            key,
+        )
         _fallback_cache[key] = payload
-        return
+        raise CacheWriteError("Redis client unavailable – data stored only in local memory")
 
     try:
-        await _redis_client.set(key, payload, ex=ttl)  # type: ignore[attr-defined]
+        result = await _redis_client.set(key, payload, ex=ttl)  # type: ignore[attr-defined]
+        if result is True or result == "OK":
+            logger.debug("✅ Redis SET succeeded for key '%s' (TTL %ss)", key, ttl)
+        else:
+            logger.error(
+                "❌ Redis SET for key '%s' returned unexpected result: %s. Storing fallback and raising.",
+                key,
+                result,
+            )
+            _fallback_cache[key] = payload
+            raise CacheWriteError("Redis SET did not acknowledge write")
     except ConnectionError as ce:
-        logger.error(f"🔌 Redis connection error on SET for '{key}': {ce}. Using in-memory fallback.")
+        logger.error(
+            "🔌 Redis connection error on SET for '%s': %s. Using in-memory fallback and raising.",
+            key,
+            ce,
+        )
         _fallback_cache[key] = payload
+        raise CacheWriteError("Redis connection failure – data stored in local memory")
 
 
 async def get_json(key: str):  # noqa: D401 – keep original signature
@@ -156,4 +162,9 @@ async def get_json(key: str):  # noqa: D401 – keep original signature
 # remains protected in-transit (TLS) when Redis is reachable, or isolated to a
 # single, hardened container instance when Redis is unavailable.  This aligns
 # with HIPAA §164.312(e)(1) – Transmission Security.
-# --------------------------------------------------------------------------- 
+# ---------------------------------------------------------------------------
+
+# Custom exception for cache write failures – allows callers to handle
+class CacheWriteError(RuntimeError):
+    """Raised when data cannot be persisted to Redis."""
+    pass 
