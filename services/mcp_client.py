@@ -44,7 +44,7 @@ async def tools_for(tenant: str) -> List[Tool]:
     # -------------------------------------------------------------------
     # 2) Fetch from MCP service over TLS, then persist to Redis (TTL 15 min)
     # -------------------------------------------------------------------
-    base = os.environ.get("MCP_BASE", "https://mcp.local")  # default to TLS
+    base = os.environ.get("MCP_BASE", "")  # default to TLS
     url = f"{base.rstrip('/')}/{tenant}/toolbox.json"
 
     try:

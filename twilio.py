@@ -15,7 +15,8 @@ from dpg import get_deepgram_service
 from ell import tts_service
 from oai import stream_agent_deltas
 from vad_events import interruption_manager
-from services.cache import get_json, set_json  # NEW
+from services.cache import get_json, set_json  
+from services import tenant_map  # cross-worker CallSid➜tenant mapping
 
 class TwilioService:
     """Service for handling Twilio calls and WebSocket interactions"""
@@ -74,6 +75,30 @@ class TwilioService:
             )
         
         logger.info(f"Incoming call received: {call_sid}")
+        
+        # Determine tenant for this call SID early so that subsequent WebSocket
+        # traffic can reuse the correct context (avoids accidental override to
+        # the generic `stream` host).  Prefer the explicit X-Tenant-Id header
+        # set by API Gateway; fall back to the sub-domain of the Host header –
+        # this mirrors logic in middlewares/tenant.py but avoids an extra DB
+        # round-trip.  Doing this here guarantees that the later WebSocket
+        # handler will have the authoritative tenant mapping and satisfies the
+        # HIPAA §164.312(a)(1) Access Control requirement to **consistently**
+        # scope data access per tenant.
+        tenant_header = request.headers.get("x-tenant-id", "").strip().lower()
+        if tenant_header:
+            tenant_part = tenant_header.split(".")[0]
+        else:
+            host_hdr = request.headers.get("host", "")
+            tenant_part = host_hdr.split(":")[0].split(".")[0].lower() if host_hdr else "default"
+
+        # Persist mapping only if we have not seen this CallSid before
+        if call_sid not in self.call_to_tenant:
+            resolved_tenant = tenant_part or "default"
+            self.call_to_tenant[call_sid] = resolved_tenant
+            logger.debug("Mapped CallSid %s ➜ tenant '%s'", call_sid, resolved_tenant)
+            # Persist mapping so other workers can retrieve it (horizontal scaling safe)
+            await tenant_map.set_tenant(call_sid, resolved_tenant)
         
         # Log additional Twilio parameters for debugging
         try:
@@ -234,6 +259,19 @@ class TwilioService:
                                         self.call_to_stream_sid[call_sid] = stream_sid
                                         session_id = f"{call_sid}_{uuid.uuid4()}"
                                         self.active_connections[session_id] = websocket
+                                        
+                                        # Preserve earlier tenant mapping if present; otherwise derive
+                                        if call_sid not in self.call_to_tenant:
+                                            # Try cross-worker lookup first (set by /voice webhook)
+                                            mapped = await tenant_map.get_tenant(call_sid)
+                                            if mapped:
+                                                self.call_to_tenant[call_sid] = mapped
+                                            else:
+                                                self.call_to_tenant[call_sid] = tenant_part or "default"
+                                            logger.debug("Mapped CallSid %s ➜ tenant '%s' (derived at WS start)", call_sid, self.call_to_tenant[call_sid])
+                                            # Ensure mapping persisted
+                                            await tenant_map.set_tenant(call_sid, self.call_to_tenant[call_sid])
+                                        
                                         logger.info(f"🔍 Proactively starting Deepgram connection for call: {call_sid}")
                                         # Start Deepgram connection in background to reduce TTS latency
                                         asyncio.create_task(self.deepgram_service.setup_connection(call_sid))
@@ -256,13 +294,13 @@ class TwilioService:
                                         # Map call to tenant id for later DB/Redis lookups (derive from Host header)
                                         host_header = websocket.headers.get("host", "")
                                         tenant_part = host_header.split(":")[0].split(".")[0].lower() if host_header else "default"
-                                        self.call_to_tenant[call_sid] = tenant_part or "default"
-                                        
-                                        # Ensure Redis history key exists
-                                        history_key = f"{self.call_to_tenant[call_sid]}:hist:{call_sid}"
-                                        existing_hist = await get_json(history_key)
-                                        if existing_hist is None:
-                                            await set_json(history_key, [])
+                                        # Do not overwrite an existing tenant mapping established during the
+                                        # /voice webhook.  This prevents "stream" host from clobbering the
+                                        # real tenant (e.g. "clinicdev") and avoids downstream MCP lookup
+                                        # failures which halted OpenAI agent execution.
+                                        if call_sid not in self.call_to_tenant:
+                                            self.call_to_tenant[call_sid] = tenant_part or "default"
+                                            logger.debug("Mapped CallSid %s ➜ tenant '%s' (derived at WS connect)", call_sid, self.call_to_tenant[call_sid])
                                         
                                         # Exit the loop now that we have CallSid
                                         break
@@ -299,7 +337,18 @@ class TwilioService:
                                         # Map call to tenant id for later DB/Redis lookups (derive from Host header)
                                         host_header = websocket.headers.get("host", "")
                                         tenant_part = host_header.split(":")[0].split(".")[0].lower() if host_header else "default"
-                                        self.call_to_tenant[call_sid] = tenant_part or "default"
+                                        # Do not overwrite an existing tenant mapping established during the
+                                        # /voice webhook.  This prevents "stream" host from clobbering the
+                                        # real tenant (e.g. "clinicdev") and avoids downstream MCP lookup
+                                        # failures which halted OpenAI agent execution.
+                                        if call_sid not in self.call_to_tenant:
+                                            mapped = await tenant_map.get_tenant(call_sid)
+                                            if mapped:
+                                                self.call_to_tenant[call_sid] = mapped
+                                            else:
+                                                self.call_to_tenant[call_sid] = tenant_part or "default"
+                                            logger.debug("Mapped CallSid %s ➜ tenant '%s' (derived at WS connect)", call_sid, self.call_to_tenant[call_sid])
+                                            await tenant_map.set_tenant(call_sid, self.call_to_tenant[call_sid])
                                         
                                         # Exit the loop now that we have CallSid
                                         break
@@ -386,8 +435,16 @@ class TwilioService:
                 # Main message handling loop
                 logger.info(f"Successfully extracted CallSid {call_sid}, entering main WebSocket loop")
                 
-                # Ensure tenant history exists in redis
-                history_key = f"{self.call_to_tenant.get(call_sid, 'default')}:hist:{call_sid}"
+                # Ensure tenant history exists in Redis. Retrieve from in-memory
+                # mapping first, then cross-worker cache as a fallback.
+                tenant_id = self.call_to_tenant.get(call_sid, "default")
+                if tenant_id == "default":
+                    mapped = await tenant_map.get_tenant(call_sid)
+                    if mapped:
+                        tenant_id = mapped
+                        self.call_to_tenant[call_sid] = mapped
+
+                history_key = f"{tenant_id}:hist:{call_sid}"
                 existing_hist = await get_json(history_key)
                 if existing_hist is None:
                     await set_json(history_key, [])
@@ -552,6 +609,11 @@ class TwilioService:
         """
         logger.debug(f"🔍 process_transcript invoked for call {call_sid}, is_final={is_final}: '{transcript}'")
         tenant = self.call_to_tenant.get(call_sid, "default")
+        if tenant == "default":
+            mapped = await tenant_map.get_tenant(call_sid)
+            if mapped:
+                tenant = mapped
+                self.call_to_tenant[call_sid] = mapped
         
         # Drop non-final transcripts and skip response if agent cannot speak yet
         if not is_final:

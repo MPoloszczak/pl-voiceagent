@@ -346,6 +346,8 @@ class TTSService:
                 try:
                     async for delta in delta_generator:
                         text_queue.put(delta)
+                except Exception as e:
+                    logger.error(f"❌ PIPELINE ERROR: delta generator failed for call {call_sid}: {e}")
                 finally:
                     text_queue.put(None)
             feed_task = asyncio.create_task(_feed_text())
