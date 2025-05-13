@@ -1,4 +1,4 @@
-openai-agents==0.0.11
+openai-agents==0.0.14
 deepgram-sdk==3.10.1
 fastapi==0.112.0
 uvicorn==0.34.0
