@@ -1,5 +1,7 @@
 # 'logging' no longer required after tool removal
 import asyncio
+import httpx
+from openai import AsyncOpenAI
 
 from agents import Agent, Runner
 from openai.types.responses import ResponseTextDeltaEvent
@@ -34,6 +36,12 @@ Remember to be conversational, not corporate. Make the user feel valued and unde
 """,
     model="gpt-4o"
 )
+
+
+_httpx_client: httpx.AsyncClient = httpx.AsyncClient()
+
+# Single shared client for all Agent runs
+_oai_client: AsyncOpenAI = AsyncOpenAI(http_client=_httpx_client)
 
 class StreamingHandle:
     """Wrap an async generator to allow cancellation of the LLM stream."""
@@ -75,8 +83,8 @@ async def get_agent_response(transcript, call_conversation_history, tenant_id: s
     # Create input with conversation history
     agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
     
-    # Run the agent
-    result = await Runner.run(medspa_agent, agent_input)
+    # Run the agent (pass pre-configured OpenAI client to satisfy SDK)
+    result = await Runner.run(medspa_agent, agent_input, client=_oai_client)
     
     # Get the agent response
     agent_response = result.final_output
@@ -104,14 +112,16 @@ async def stream_agent_deltas(transcript: str, call_conversation_history: list, 
     # Compose the input including history and the latest user message
     agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
 
- 
-
     loop = asyncio.get_running_loop()
     updated_hist_future: asyncio.Future = loop.create_future()
 
     async def _delta_generator():
         # 1) Create the streamed run **inside** the consumer coroutine.
-        streaming_result = Runner.run_streamed(medspa_agent, agent_input)
+        streaming_result = Runner.run_streamed(
+            medspa_agent,
+            agent_input,
+            client=_oai_client,  # ensure an AsyncClient instance is supplied
+        )
 
         # 2) Relay deltas to the caller in real-time.
         async for event in streaming_result.stream_events():
