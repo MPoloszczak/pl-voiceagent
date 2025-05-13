@@ -3,7 +3,7 @@ import asyncio
 import httpx
 from openai import AsyncOpenAI
 
-from agents import Agent, Runner
+from agents import Agent, Runner, set_default_openai_client
 from openai.types.responses import ResponseTextDeltaEvent
 
 from utils import logger
@@ -40,8 +40,13 @@ Remember to be conversational, not corporate. Make the user feel valued and unde
 
 _httpx_client: httpx.AsyncClient = httpx.AsyncClient()
 
-# Single shared client for all Agent runs
+# Pre-instantiated OpenAI client shared across all runner calls. Using
+# `set_default_openai_client` lets the Agents SDK pick it up implicitly
+# instead of passing an unsupported `client=` kwarg to Runner.* APIs.
 _oai_client: AsyncOpenAI = AsyncOpenAI(http_client=_httpx_client)
+
+# Register the client once for the entire process (thread-safe).
+set_default_openai_client(_oai_client)
 
 class StreamingHandle:
     """Wrap an async generator to allow cancellation of the LLM stream."""
@@ -83,8 +88,8 @@ async def get_agent_response(transcript, call_conversation_history, tenant_id: s
     # Create input with conversation history
     agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
     
-    # Run the agent (pass pre-configured OpenAI client to satisfy SDK)
-    result = await Runner.run(medspa_agent, agent_input, client=_oai_client)
+    # Run the agent – the default OpenAI client has already been registered
+    result = await Runner.run(medspa_agent, agent_input)
     
     # Get the agent response
     agent_response = result.final_output
@@ -120,7 +125,6 @@ async def stream_agent_deltas(transcript: str, call_conversation_history: list, 
         streaming_result = Runner.run_streamed(
             medspa_agent,
             agent_input,
-            client=_oai_client,  # ensure an AsyncClient instance is supplied
         )
 
         # 2) Relay deltas to the caller in real-time.
