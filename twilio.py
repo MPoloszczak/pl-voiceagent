@@ -627,13 +627,15 @@ class TwilioService:
             history_key = f"{tenant}:hist:{call_sid}"
             conversation_history = await get_json(history_key) or []
             
-            # Process with agent via streaming and capture cancellation handle
-            updated_history, delta_generator, llm_handle = await stream_agent_deltas(transcript, conversation_history, tenant)
+            # Process with agent via streaming (single LLM call) and capture
+            # cancellation handle.  The first element is now a Future that
+            # resolves once streaming completes, ensuring we persist the
+            # final conversation state **after** the agent finishes.
+            history_future, delta_generator, llm_handle = await stream_agent_deltas(
+                transcript, conversation_history, tenant
+            )
             # Register LLM streaming handle so it can be cancelled on barge-in
             interruption_manager.register_llm_handle(call_sid, llm_handle)
-            
-            # Update conversation history
-            await set_json(history_key, updated_history)
             
             logger.info(f"⏩ PIPELINE: Streaming agent response for call {call_sid}")
             
@@ -664,9 +666,24 @@ class TwilioService:
                 logger.error(f"❌ No Stream SID found for call {call_sid}. Cannot send response.")
                 return
             
-            # Stream the response with low-latency TTS
-            await tts_service.stream_response_to_user(call_sid, delta_generator, websocket, stream_sid)
-            
+            # Stream the response with low-latency TTS – when this
+            # coroutine returns the delta generator has completed, so the
+            # history_future is now resolved.
+            await tts_service.stream_response_to_user(
+                call_sid, delta_generator, websocket, stream_sid
+            )
+
+            # Persist updated history once available (should be resolved
+            # at this point; if not, we await with a short timeout to
+            # avoid blocking indefinitely).
+            try:
+                updated_history = await asyncio.wait_for(history_future, timeout=2.0)
+                await set_json(history_key, updated_history)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"History future did not resolve in time for call {call_sid}; using existing history."
+                )
+
             # Clear handle registration once streaming completes
             interruption_manager.register_llm_handle(call_sid, None)
             
