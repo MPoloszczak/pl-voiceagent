@@ -1,14 +1,18 @@
 import os
 import httpx
+import json
 from typing import List
 from agents import Tool
-
-_timeout = httpx.Timeout(5.0)
-_client = httpx.AsyncClient(timeout=_timeout, http2=True)
 
 # Centralised Redis cache helpers (with TLS + automatic in-memory fallback)
 from services.cache import get_json, set_json
 
+# A slightly longer read timeout (15s) accommodates SSE handshakes while
+# keeping connect / write timeouts strict.  HIPAA §164.312(e)(1) requires
+# encryption in-transit but does not prescribe RTTs – we tune for UX.
+
+_timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=None)
+_client = httpx.AsyncClient(timeout=_timeout, http2=True)
 
 async def tools_for(tenant: str) -> List[Tool]:
     """Return the tool list for *tenant*.
@@ -44,29 +48,67 @@ async def tools_for(tenant: str) -> List[Tool]:
     # -------------------------------------------------------------------
     # 2) Fetch from MCP service over TLS, then persist to Redis (TTL 15 min)
     # -------------------------------------------------------------------
-    base = os.environ.get("MCP_BASE", "")  # default to TLS
-    url = f"{base.rstrip('/')}/{tenant}/toolbox.json"
+    base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
+
+    async def _remote_fetch() -> List[Tool]:
+        """Fetch toolbox over HTTPS/SSE per MCP best-practices.
+
+        The endpoint *may* emit `text/event-stream` – in that case we read the
+        first `data:` frame (JSON-RPC payload) and immediately close the
+        connection.  This matches the reference FastMCP implementation and
+        avoids holding an open stream longer than needed (least-privilege &
+        resource stewardship – HIPAA §164.308(a)(3)(i)).
+        """
+
+        url = f"{base.rstrip('/')}/{tenant}/toolbox.json"
+
+        headers = {"Accept": "application/json, text/event-stream"}
+
+        async with _client.stream("GET", url, headers=headers) as resp:
+            resp.raise_for_status()
+
+            ctype = resp.headers.get("content-type", "")
+
+            if "text/event-stream" in ctype:
+                # Iterate until first `data:` frame.
+                async for line in resp.aiter_lines():
+                    if not line or line.startswith(":"):
+                        # comment / heartbeat per SSE spec
+                        continue
+                    if line.startswith("data:"):
+                        payload = line[len("data:"):].strip()
+                        data = json.loads(payload)
+                        return [Tool(**item) for item in data]
+
+                raise ValueError("SSE stream closed before toolbox payload received")
+
+            # Non-SSE JSON response.
+            data = await resp.json()
+            return [Tool(**item) for item in data]
 
     try:
-        resp = await _client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
-        tools = [Tool(**item) for item in data]
+        tools = await _remote_fetch()
 
         # Cache raw JSON so it can be reconstructed easily and is JSON-serialisable.
-        await set_json(cache_key, data, ttl=900)  # 15-minute TTL
+        def _dump(t: Tool):
+            if hasattr(t, "model_dump"):
+                return t.model_dump()
+            if hasattr(t, "dict"):
+                return t.dict()
+            return t.__dict__
+
+        await set_json(cache_key, [_dump(t) for t in tools], ttl=900)
         return tools
 
-    except (httpx.HTTPError, OSError) as exc:
+    except (httpx.HTTPError, OSError, ValueError, json.JSONDecodeError) as exc:
         logger.error(
             f"Failed to fetch tools for tenant '{tenant}' from MCP: {exc}. Using cached/empty toolbox."
         )
 
         if cached:
-            # We already tried to parse earlier but may return anyway (better than empty)
             try:
                 return [Tool(**item) for item in cached]
             except Exception:
-                pass  # fall through to empty
+                pass  # fall through
 
         return [] 

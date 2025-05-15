@@ -12,6 +12,7 @@ services:
       - .env
     environment:
       PORT: 8080  # Changed port to 8080
+      MCP_BASE: https://mcp.pololabsai.com
      
     restart: unless-stopped
     volumes:

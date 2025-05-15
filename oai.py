@@ -7,6 +7,14 @@ from agents import Agent, Runner, set_default_openai_client
 from openai.types.responses import ResponseTextDeltaEvent
 
 from utils import logger
+# Dynamic MCP integration per tenant
+import os
+# Preferred SDK-native MCP server integration
+try:
+    from agents.mcp.server import MCPServerSse  # type: ignore
+except ImportError:  # fallback if extension not installed
+    MCPServerSse = None  # type: ignore
+
 from services.mcp_client import tools_for
 
 # ------------------------------------------------------------------
@@ -79,11 +87,28 @@ async def get_agent_response(transcript, call_conversation_history, tenant_id: s
     """
     logger.info(f"Running medspa agent with input: {transcript}")
 
-    # Load dynamic tools per tenant (empty list fallback keeps agent functional)
-    try:
-        medspa_agent.tools = await tools_for(tenant_id)
-    except Exception as e:
-        logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
+  
+
+    if MCPServerSse is not None:
+        try:
+            base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
+            server = MCPServerSse(
+                params={"url": f"{base}/{tenant_id}"},
+                cache_tools_list=True,
+                name=f"{tenant_id}-mcp",
+            )
+            medspa_agent.mcp_servers = [server]
+        except Exception as e:
+            logger.error(f"Failed to configure MCP server for tenant {tenant_id}: {e}")
+            try:
+                medspa_agent.tools = await tools_for(tenant_id)
+            except Exception as e2:
+                logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e2}")
+    else:
+        try:
+            medspa_agent.tools = await tools_for(tenant_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
 
     # Create input with conversation history
     agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
@@ -109,10 +134,26 @@ async def stream_agent_deltas(transcript: str, call_conversation_history: list, 
         handle                 : StreamingHandle object with .cancel() used by VAD
     """
     # Load dynamic tools for tenant
-    try:
-        medspa_agent.tools = await tools_for(tenant_id)
-    except Exception as e:
-        logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
+    if MCPServerSse is not None:
+        try:
+            base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
+            server = MCPServerSse(
+                params={"url": f"{base}/{tenant_id}"},
+                cache_tools_list=True,
+                name=f"{tenant_id}-mcp",
+            )
+            medspa_agent.mcp_servers = [server]
+        except Exception as e:
+            logger.error(f"Failed to configure MCP server for tenant {tenant_id}: {e}")
+            try:
+                medspa_agent.tools = await tools_for(tenant_id)
+            except Exception as e2:
+                logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e2}")
+    else:
+        try:
+            medspa_agent.tools = await tools_for(tenant_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
 
     # Compose the input including history and the latest user message
     agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
