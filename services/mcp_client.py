@@ -12,7 +12,7 @@ from services.cache import get_json, set_json
 # encryption in-transit but does not prescribe RTTs – we tune for UX.
 
 _timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=None)
-_client = httpx.AsyncClient(timeout=_timeout, http2=True)
+_client = httpx.AsyncClient(timeout=_timeout, http2=True, follow_redirects=True)
 
 async def tools_for(tenant: str) -> List[Tool]:
     """Return the tool list for *tenant*.
@@ -64,7 +64,7 @@ async def tools_for(tenant: str) -> List[Tool]:
 
         headers = {"Accept": "application/json, text/event-stream"}
 
-        async with _client.stream("GET", url, headers=headers) as resp:
+        async with _client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
             resp.raise_for_status()
 
             ctype = resp.headers.get("content-type", "")

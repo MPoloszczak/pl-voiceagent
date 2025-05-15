@@ -93,7 +93,7 @@ async def get_agent_response(transcript, call_conversation_history, tenant_id: s
         try:
             base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
             server = MCPServerSse(
-                params={"url": f"{base}/{tenant_id}"},
+                params={"url": f"{base}/sse/"},
                 cache_tools_list=True,
                 name=f"{tenant_id}-mcp",
             )
@@ -138,7 +138,7 @@ async def stream_agent_deltas(transcript: str, call_conversation_history: list, 
         try:
             base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
             server = MCPServerSse(
-                params={"url": f"{base}/{tenant_id}"},
+                params={"url": f"{base}/sse/"},
                 cache_tools_list=True,
                 name=f"{tenant_id}-mcp",
             )
