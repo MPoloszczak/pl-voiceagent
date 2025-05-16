@@ -97,6 +97,20 @@ async def get_agent_response(transcript, call_conversation_history, tenant_id: s
                 cache_tools_list=True,
                 name=f"{tenant_id}-mcp",
             )
+            try:
+                # Ensure the SSE connection is opened before the server is used by the Agent.
+                # The Agents SDK requires an explicit `connect()` call; otherwise, a
+                # `Server not initialized` error is raised when the tool invocation occurs.
+                await server.connect()
+            except Exception as conn_exc:
+                logger.error(
+                    f"Failed to connect to MCP server for tenant {tenant_id}: {conn_exc}"
+                )
+                # Fallback to static tool loading so the application can still function.
+                try:
+                    medspa_agent.tools = await tools_for(tenant_id)
+                except Exception as e2:
+                    logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e2}")
             medspa_agent.mcp_servers = [server]
         except Exception as e:
             logger.error(f"Failed to configure MCP server for tenant {tenant_id}: {e}")
@@ -142,6 +156,16 @@ async def stream_agent_deltas(transcript: str, call_conversation_history: list, 
                 cache_tools_list=True,
                 name=f"{tenant_id}-mcp",
             )
+            try:
+                await server.connect()
+            except Exception as conn_exc:
+                logger.error(
+                    f"Failed to connect to MCP server for tenant {tenant_id}: {conn_exc}"
+                )
+                try:
+                    medspa_agent.tools = await tools_for(tenant_id)
+                except Exception as e2:
+                    logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e2}")
             medspa_agent.mcp_servers = [server]
         except Exception as e:
             logger.error(f"Failed to configure MCP server for tenant {tenant_id}: {e}")
@@ -149,11 +173,14 @@ async def stream_agent_deltas(transcript: str, call_conversation_history: list, 
                 medspa_agent.tools = await tools_for(tenant_id)
             except Exception as e2:
                 logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e2}")
-    else:
-        try:
-            medspa_agent.tools = await tools_for(tenant_id)
-        except Exception as e:
-            logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
+
+    # If a server was configured but failed to establish a connection, clear it
+    try:
+        if MCPServerSse is not None and server is not None and not getattr(server, "_connected", True):
+            medspa_agent.mcp_servers.clear()
+    except NameError:
+        # 'server' may not be defined if MCP was not enabled – ignore gracefully.
+        pass
 
     # Compose the input including history and the latest user message
     agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
