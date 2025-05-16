@@ -217,3 +217,147 @@ async def stream_agent_deltas(transcript: str, call_conversation_history: list, 
     handle = StreamingHandle(agen)
 
     return updated_hist_future, agen, handle
+
+async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
+    """Attach a connected ``MCPServerSse`` to *agent* or fall back to static tools.
+
+    The upstream `MCPServerSse.connect()` implementation has a known race––see
+    https://github.com/block/goose/issues/1390 ––where endpoint discovery may
+    time-out after ~1 s instead of the documented 5 s.  We therefore retry the
+    *connect()* call a few times with a back-off before giving up.  If we still
+    cannot establish a connection we **do not** register the server on the
+    agent – this prevents the fatal ``Server not initialized`` error observed
+    in CloudWatch and ensures the assistant continues operating with a static
+    toolbox.
+    """
+
+    # Remove any previous server registration to avoid stale handles across
+    # multiple tenant invocations within the same process.
+    try:
+        agent.mcp_servers.clear()  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+
+    # If the optional extension is unavailable we default to static tools.
+    if MCPServerSse is None:
+        try:
+            agent.tools = await tools_for(tenant_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
+        return
+
+    base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
+
+    server = MCPServerSse(
+        params={"url": f"{base}/sse/"},
+        cache_tools_list=True,
+        name=f"{tenant_id}-mcp",
+    )
+
+    max_attempts = 3  # empirical – covers ~3 s » 9 s total wait
+    backoff = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Wait up to 6 s for each attempt to account for network latency
+            await asyncio.wait_for(server.connect(), timeout=6.0)
+            # Success – attach and return.
+            agent.mcp_servers = [server]
+            return
+        except Exception as exc:  # noqa: BLE001 – broad except to keep agent alive
+            logger.warning(
+                f"Attempt {attempt}/{max_attempts}: failed to connect to MCP "
+                f"server for tenant {tenant_id}: {exc}"
+            )
+            await asyncio.sleep(backoff)
+            backoff *= 2  # simple exponential back-off
+
+    # All attempts exhausted – fall back to static toolbox.
+    try:
+        agent.tools = await tools_for(tenant_id)
+        logger.info(
+            f"Using cached/static toolbox for tenant {tenant_id} after MCP "
+            "connection failures."
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
+
+async def get_agent_response(transcript, call_conversation_history, tenant_id: str):
+    """
+    Process transcripts with the agent and generate a response.
+    
+    Args:
+        transcript: The transcript text from the user
+        call_conversation_history: The conversation history for this call
+        tenant_id: The ID of the tenant
+
+    Returns:
+        tuple: (updated_history, response_text)
+    """
+    logger.info(f"Running medspa agent with input: {transcript}")
+
+  
+
+    # Refresh MCP/toolbox configuration for this tenant.
+    await _init_mcp_server(medspa_agent, tenant_id)
+
+    # Create input with conversation history
+    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
+    
+    # Run the agent – the default OpenAI client has already been registered
+    result = await Runner.run(medspa_agent, agent_input)
+    
+    # Get the agent response
+    agent_response = result.final_output
+    
+    # Return updated history and response
+    return result.to_input_list(), agent_response 
+
+async def stream_agent_deltas(transcript: str, call_conversation_history: list, tenant_id: str):
+    """
+    Stream the agent response and expose a cancellation handle.
+
+    Returns
+    -------
+    tuple(updated_history_future, async_generator, handle)
+        updated_history_future : asyncio.Future  Resolves to the updated conversation history once the stream completes
+        async_generator        : AsyncGenerator  Yields raw text deltas for TTS
+        handle                 : StreamingHandle object with .cancel() used by VAD
+    """
+    # Refresh MCP/toolbox configuration for this tenant (streaming variant)
+    await _init_mcp_server(medspa_agent, tenant_id)
+
+    # Compose the input including history and the latest user message
+    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
+
+    loop = asyncio.get_running_loop()
+    updated_hist_future: asyncio.Future = loop.create_future()
+
+    async def _delta_generator():
+        # 1) Create the streamed run **inside** the consumer coroutine.
+        streaming_result = Runner.run_streamed(
+            medspa_agent,
+            agent_input,
+        )
+
+        # 2) Relay deltas to the caller in real-time.
+        async for event in streaming_result.stream_events():
+            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                yield event.data.delta
+
+        # 3) When streaming completes, resolve the history Future so the
+        #    caller can persist.  This happens *after* the final delta to
+        #    guarantee ordering (required for consistent audit trail).
+        try:
+            if not updated_hist_future.done():
+                updated_hist_future.set_result(streaming_result.to_input_list())
+        except Exception as hist_exc:
+            # Never propagate – instead set the original input so that the
+            # caller at least has a consistent baseline.
+            logger.error(f"Failed to build updated history: {hist_exc}")
+            if not updated_hist_future.done():
+                updated_hist_future.set_result(agent_input)
+
+    agen = _delta_generator()
+    handle = StreamingHandle(agen)
+
+    return updated_hist_future, agen, handle
