@@ -8,13 +8,16 @@ from openai.types.responses import ResponseTextDeltaEvent
 from utils import logger
 # Dynamic MCP integration per tenant
 import os
-# Preferred SDK-native MCP server integration (MCP 2025-03-26 – HTTP transport only)
-try:
-    from agents.mcp.server import MCPServerHttp  # type: ignore
-except ImportError:
-    MCPServerHttp = None  # type: ignore
 
-MCPServerSse = None  # type: ignore
+
+try:
+    from agents.mcp.server import (
+        MCPServerStreamableHttp,
+        MCPServerStreamableHttpParams,
+    )
+except ImportError:  # pragma: no cover – SDK not available in CI mocks
+    MCPServerStreamableHttp = None  # type: ignore
+    MCPServerStreamableHttpParams = dict  # type: ignore
 
 # Protocol version header used for all outbound MCP requests.
 MCP_PROTOCOL_VERSION = "2025-03-26"
@@ -52,9 +55,7 @@ Remember to be conversational, not corporate. Make the user feel valued and unde
 
 _httpx_client: httpx.AsyncClient = httpx.AsyncClient()
 
-# Pre-instantiated OpenAI client shared across all runner calls. Using
-# `set_default_openai_client` lets the Agents SDK pick it up implicitly
-# instead of passing an unsupported `client=` kwarg to Runner.* APIs.
+
 _oai_client: AsyncOpenAI = AsyncOpenAI(http_client=_httpx_client)
 
 # Register the client once for the entire process (thread-safe).
@@ -77,14 +78,9 @@ class StreamingHandle:
         except Exception:
             pass
 
-# ---------------------------------------------------------------------------
-# Legacy SSE transport helpers have been deprecated in favour of the unified
-# HTTP + JSON-RPC transport introduced in MCP 2025-03-26.  All functionality
-# is now provided by the implementation that follows below.
-# ---------------------------------------------------------------------------
 
 async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
-    """Initialise and attach a *Streamable HTTP* ``MCPServerHttp`` instance.
+    """Initialise and attach a *Streamable HTTP* ``MCPServerStreamableHttp`` instance.
 
     As recommended by the 2025-03-26 MCP specification (§3.1.4), we prefer the
     consolidated HTTP+JSON-RPC transport which optionally upgrades to SSE for
@@ -104,21 +100,23 @@ async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
         pass
 
 
-    if MCPServerHttp is None:
-        logger.error("MCPServerHttp class not available – cannot initialise MCP HTTP transport.")
+    if MCPServerStreamableHttp is None:
+        logger.error(
+            "MCPServerStreamableHttp class not available – cannot initialise MCP HTTP transport."
+        )
         raise RuntimeError("MCP HTTP transport unavailable in current runtime")
 
     base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
 
-    server = MCPServerHttp(
-        params={
-            "url": f"{base}/mcp",  # Unified /mcp endpoint per spec
-            # Mandatory protocol negotiation headers (MCP 2025-03-26 §4.1)
-            "headers": {
-                "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
-                "Accept": "application/json",
-            },
+    params: "MCPServerStreamableHttpParams" = {
+        "url": f"{base}/mcp",
+        "headers": {
+            "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
         },
+    }
+
+    server = MCPServerStreamableHttp(
+        params=params,
         cache_tools_list=True,
         name=f"{tenant_id}-mcp-http",
     )
