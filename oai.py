@@ -11,9 +11,10 @@ from utils import logger
 import os
 # Preferred SDK-native MCP server integration
 try:
-    from agents.mcp.server import MCPServerSse  # type: ignore
+    from agents.mcp.server import MCPServerSse, MCPServerHttp  # type: ignore
 except ImportError:  # fallback if extension not installed
     MCPServerSse = None  # type: ignore
+    MCPServerHttp = None  # type: ignore
 
 from services.mcp_client import tools_for
 
@@ -219,16 +220,16 @@ async def stream_agent_deltas(transcript: str, call_conversation_history: list, 
     return updated_hist_future, agen, handle
 
 async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
-    """Attach a connected ``MCPServerSse`` to *agent* or fall back to static tools.
+    """Initialise and attach a *Streamable HTTP* ``MCPServerHttp`` instance.
 
-    The upstream `MCPServerSse.connect()` implementation has a known race––see
-    https://github.com/block/goose/issues/1390 ––where endpoint discovery may
-    time-out after ~1 s instead of the documented 5 s.  We therefore retry the
-    *connect()* call a few times with a back-off before giving up.  If we still
-    cannot establish a connection we **do not** register the server on the
-    agent – this prevents the fatal ``Server not initialized`` error observed
-    in CloudWatch and ensures the assistant continues operating with a static
-    toolbox.
+    As recommended by the 2025-03-26 MCP specification (§3.1.4), we prefer the
+    consolidated HTTP+JSON-RPC transport which optionally upgrades to SSE for
+    streaming.  This approach eliminates the task-group race condition present
+    in the legacy SSE-only client implementation (see Anthropic Agents SDK
+    issue #1390) and therefore provides a more robust connection strategy for
+    latency-sensitive ECS workloads.  No alternative transports are attempted:
+    if the HTTP initialisation fails we propagate the error so that the caller
+    can respond appropriately (in accordance with the "no fallbacks" policy).
     """
 
     # Remove any previous server registration to avoid stale handles across
@@ -238,48 +239,36 @@ async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
     except AttributeError:
         pass
 
-    # If the optional extension is unavailable we default to static tools.
-    if MCPServerSse is None:
-        try:
-            agent.tools = await tools_for(tenant_id)
-        except Exception as e:
-            logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
-        return
+
+    if MCPServerHttp is None:
+        logger.error("MCPServerHttp class not available – cannot initialise MCP HTTP transport.")
+        raise RuntimeError("MCP HTTP transport unavailable in current runtime")
 
     base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
 
-    server = MCPServerSse(
-        params={"url": f"{base}/sse/"},
+    server = MCPServerHttp(
+        params={"url": f"{base}/mcp"},  # Unified /mcp endpoint per spec
         cache_tools_list=True,
-        name=f"{tenant_id}-mcp",
+        name=f"{tenant_id}-mcp-http",
     )
 
-    max_attempts = 3  # empirical – covers ~3 s » 9 s total wait
-    backoff = 1.0
-    for attempt in range(1, max_attempts + 1):
-        try:
-            # Wait up to 6 s for each attempt to account for network latency
-            await asyncio.wait_for(server.connect(), timeout=6.0)
-            # Success – attach and return.
-            agent.mcp_servers = [server]
-            return
-        except Exception as exc:  # noqa: BLE001 – broad except to keep agent alive
-            logger.warning(
-                f"Attempt {attempt}/{max_attempts}: failed to connect to MCP "
-                f"server for tenant {tenant_id}: {exc}"
-            )
-            await asyncio.sleep(backoff)
-            backoff *= 2  # simple exponential back-off
-
-    # All attempts exhausted – fall back to static toolbox.
+    # Some SDK versions expose an async connect(); use it when present to
+    # perform eager endpoint discovery and auth validation.
     try:
-        agent.tools = await tools_for(tenant_id)
+        if hasattr(server, "connect") and asyncio.iscoroutinefunction(server.connect):
+            await asyncio.wait_for(server.connect(), timeout=6.0)
+        agent.mcp_servers = [server]
         logger.info(
-            f"Using cached/static toolbox for tenant {tenant_id} after MCP "
-            "connection failures."
+            f"✅ Connected to MCP HTTP transport for tenant {tenant_id} at {base}/mcp"
         )
-    except Exception as e:
-        logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
+    except Exception as exc:  # noqa: BLE001 – surface failures to caller
+        logger.error(
+            f"❌ Failed to initialise MCP HTTP transport for tenant {tenant_id}: {exc}"
+        )
+        # Propagate – the caller may choose to handle this, but we do *not*
+        # fall back to alternative transports to respect the no-fallback
+        # policy.
+        raise
 
 async def get_agent_response(transcript, call_conversation_history, tenant_id: str):
     """
