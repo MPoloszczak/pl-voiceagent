@@ -3,7 +3,7 @@ deepgram-sdk==3.10.1
 fastapi==0.112.0
 uvicorn==0.34.0
 elevenlabs==1.5.0
-python-dotenv==1.0.0 
+python-dotenv>=1.1.0,<2.0
 websockets>=12.0
 httpx[http2]>=0.28.1,<0.29
 dataclasses-json==0.*
