@@ -110,8 +110,12 @@ async def _init_mcp_server(agent: Agent, tenant_id: str, session_id: Optional[st
     base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
 
     headers = {
-        "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
-        "Mcp-Session-Id": session_id,
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+        "MCP-Session-Id": session_id,
     }
     params: "MCPServerStreamableHttpParams" = {
         "url": f"{base}/{tenant_id}/mcp",
