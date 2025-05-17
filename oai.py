@@ -1,6 +1,7 @@
 import asyncio
 import httpx
 from openai import AsyncOpenAI
+from typing import Optional
 
 from agents import Agent, Runner, set_default_openai_client
 from openai.types.responses import ResponseTextDeltaEvent
@@ -79,7 +80,7 @@ class StreamingHandle:
             pass
 
 
-async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
+async def _init_mcp_server(agent: Agent, tenant_id: str, session_id: Optional[str] = None) -> None:
     """Initialise and attach a *Streamable HTTP* ``MCPServerStreamableHttp`` instance.
 
     As recommended by the 2025-03-26 MCP specification (§3.1.4), we prefer the
@@ -108,12 +109,13 @@ async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
 
     base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
 
+    headers = {
+        "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
+        "Mcp-Session-Id": session_id,
+    }
     params: "MCPServerStreamableHttpParams" = {
         "url": f"{base}/{tenant_id}/mcp",
-        "headers": {
-            "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
-            "Mcp-Session-Id": None,
-        },
+        "headers": headers,
     }
 
     server = MCPServerStreamableHttp(
@@ -149,6 +151,7 @@ async def get_agent_response(
     transcript: str,
     call_conversation_history: list,
     tenant_id: str,
+    session_id: Optional[str] = None,
 ) -> tuple[list, str]:
     """Generate a full assistant response using the HTTP+JSON-RPC MCP transport.
 
@@ -160,6 +163,8 @@ async def get_agent_response(
         The existing dialog history for this call (MCP-compliant OpenAI format).
     tenant_id : str
         Logical tenant identifier used to isolate tool scopes and auth.
+    session_id : Optional[str], optional
+        Session ID for the MCP request, by default None
 
     Returns
     -------
@@ -171,7 +176,7 @@ async def get_agent_response(
     logger.info("Running medspa agent with input: %s", transcript)
 
     # Ensure up-to-date MCP server configuration for this tenant.
-    await _init_mcp_server(medspa_agent, tenant_id)
+    await _init_mcp_server(medspa_agent, tenant_id, session_id)
 
     agent_input = call_conversation_history + [
         {"role": "user", "content": transcript},
@@ -185,6 +190,7 @@ async def stream_agent_deltas(
     transcript: str,
     call_conversation_history: list,
     tenant_id: str,
+    session_id: Optional[str] = None,
 ):
     """Stream assistant deltas for real-time TTS while preserving history.
 
@@ -198,7 +204,7 @@ async def stream_agent_deltas(
        the in-flight stream (used by VAD).
     """
 
-    await _init_mcp_server(medspa_agent, tenant_id)
+    await _init_mcp_server(medspa_agent, tenant_id, session_id)
 
     agent_input = call_conversation_history + [
         {"role": "user", "content": transcript},

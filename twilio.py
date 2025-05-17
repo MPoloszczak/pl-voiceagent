@@ -9,11 +9,13 @@ from fastapi.responses import Response
 from starlette.websockets import WebSocketState
 import base64
 from collections import deque
+import os
+import httpx
 
 from utils import logger, TWIML_STREAM_TEMPLATE, send_periodic_pings, send_silence_keepalive, cancel_keepalive_if_needed
 from dpg import get_deepgram_service
 from ell import tts_service
-from oai import stream_agent_deltas
+from oai import stream_agent_deltas, MCP_PROTOCOL_VERSION
 from vad_events import interruption_manager
 from services.cache import get_json, set_json  
 from services import tenant_map  # cross-worker CallSid➜tenant mapping
@@ -260,6 +262,10 @@ class TwilioService:
                                         session_id = f"{call_sid}_{uuid.uuid4()}"
                                         self.active_connections[session_id] = websocket
                                         
+                                        # Cache MCP session ID for this call
+                                        tenant_id = self.call_to_tenant.get(call_sid)
+                                        await set_json(f"{tenant_id}:session:{call_sid}", session_id)
+                                        
                                         # Preserve earlier tenant mapping if present; otherwise derive
                                         if call_sid not in self.call_to_tenant:
                                             # Try cross-worker lookup first (set by /voice webhook)
@@ -323,6 +329,10 @@ class TwilioService:
                                             del self.active_connections[placeholder_id]
                                         except KeyError:
                                             pass
+                                        
+                                        # Cache MCP session ID for this call
+                                        tenant_id = self.call_to_tenant.get(call_sid)
+                                        await set_json(f"{tenant_id}:session:{call_sid}", session_id)
                                         
                                         # Generate and send welcome message immediately now that we have both Call SID and Stream SID
                                         logger.info(f"Generating welcome message immediately for call {call_sid} with Stream SID {stream_sid}")
@@ -551,6 +561,23 @@ class TwilioService:
             pending_connection_attempt["traceback"] = traceback.format_exc()
             
         finally:
+            # Terminate MCP session on call end
+            if call_sid and session_id:
+                tenant_id = self.call_to_tenant.get(call_sid)
+                if tenant_id:
+                    base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
+                    url = f"{base}/{tenant_id}/mcp"
+                    headers = {
+                        "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
+                        "Mcp-Session-Id": session_id,
+                    }
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            await client.delete(url, headers=headers)
+                        logger.info(f"✓ MCP session {session_id} terminated for call {call_sid}")
+                    except Exception as e:
+                        logger.error(f"Error terminating MCP session {session_id} for call {call_sid}: {e}")
+
             # Clean up
             if 'ping_task' in locals():
                 logger.info(f"🔍 Cancelling ping task for call: {call_sid if call_sid else 'unknown'}")
@@ -627,27 +654,23 @@ class TwilioService:
             history_key = f"{tenant}:hist:{call_sid}"
             conversation_history = await get_json(history_key) or []
             
-            # Process with agent via streaming (single LLM call) and capture
-            # cancellation handle.  The first element is now a Future that
-            # resolves once streaming completes, ensuring we persist the
-            # final conversation state **after** the agent finishes.
-            history_future, delta_generator, llm_handle = await stream_agent_deltas(
-                transcript, conversation_history, tenant
-            )
-            # Register LLM streaming handle so it can be cancelled on barge-in
-            interruption_manager.register_llm_handle(call_sid, llm_handle)
-            
-            logger.info(f"⏩ PIPELINE: Streaming agent response for call {call_sid}")
-            
-            # Find active WebSocket for this call
+            # Identify session_id for MCP session header
             matching_sessions = [sid for sid in self.active_connections.keys() if sid.startswith(f"{call_sid}_")]
-            
             if not matching_sessions:
                 logger.error(f"❌ No active WebSocket connection found for call {call_sid}")
                 return
-            
-            # Use the first matching session
             session_id = matching_sessions[0]
+
+            # Process with agent via streaming (single LLM call) and capture cancellation handle
+            history_future, delta_generator, llm_handle = await stream_agent_deltas(
+                transcript, conversation_history, tenant, session_id
+            )
+            # Register LLM streaming handle so it can be cancelled on barge-in
+            interruption_manager.register_llm_handle(call_sid, llm_handle)
+
+            logger.info(f"⏩ PIPELINE: Streaming agent response for call {call_sid}")
+
+            # Retrieve websocket for this session
             websocket = self.active_connections[session_id]
             
             # Cancel silence keep-alive when sending an agent response
