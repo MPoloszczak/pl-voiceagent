@@ -109,7 +109,7 @@ async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
     base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
 
     params: "MCPServerStreamableHttpParams" = {
-        "url": f"{base}/mcp",
+        "url": f"{base}/mcp/",
         "headers": {
             "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
         },
