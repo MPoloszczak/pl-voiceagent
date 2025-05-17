@@ -1,4 +1,3 @@
-# 'logging' no longer required after tool removal
 import asyncio
 import httpx
 from openai import AsyncOpenAI
@@ -9,12 +8,16 @@ from openai.types.responses import ResponseTextDeltaEvent
 from utils import logger
 # Dynamic MCP integration per tenant
 import os
-# Preferred SDK-native MCP server integration
+# Preferred SDK-native MCP server integration (MCP 2025-03-26 – HTTP transport only)
 try:
-    from agents.mcp.server import MCPServerSse, MCPServerHttp  # type: ignore
-except ImportError:  # fallback if extension not installed
-    MCPServerSse = None  # type: ignore
+    from agents.mcp.server import MCPServerHttp  # type: ignore
+except ImportError:
     MCPServerHttp = None  # type: ignore
+
+MCPServerSse = None  # type: ignore
+
+# Protocol version header used for all outbound MCP requests.
+MCP_PROTOCOL_VERSION = "2025-03-26"
 
 from services.mcp_client import tools_for
 
@@ -74,150 +77,11 @@ class StreamingHandle:
         except Exception:
             pass
 
-async def get_agent_response(transcript, call_conversation_history, tenant_id: str):
-    """
-    Process transcripts with the agent and generate a response.
-    
-    Args:
-        transcript: The transcript text from the user
-        call_conversation_history: The conversation history for this call
-        tenant_id: The ID of the tenant
-
-    Returns:
-        tuple: (updated_history, response_text)
-    """
-    logger.info(f"Running medspa agent with input: {transcript}")
-
-  
-
-    if MCPServerSse is not None:
-        try:
-            base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
-            server = MCPServerSse(
-                params={"url": f"{base}/sse/"},
-                cache_tools_list=True,
-                name=f"{tenant_id}-mcp",
-            )
-            try:
-                # Ensure the SSE connection is opened before the server is used by the Agent.
-                # The Agents SDK requires an explicit `connect()` call; otherwise, a
-                # `Server not initialized` error is raised when the tool invocation occurs.
-                await server.connect()
-            except Exception as conn_exc:
-                logger.error(
-                    f"Failed to connect to MCP server for tenant {tenant_id}: {conn_exc}"
-                )
-                # Fallback to static tool loading so the application can still function.
-                try:
-                    medspa_agent.tools = await tools_for(tenant_id)
-                except Exception as e2:
-                    logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e2}")
-            medspa_agent.mcp_servers = [server]
-        except Exception as e:
-            logger.error(f"Failed to configure MCP server for tenant {tenant_id}: {e}")
-            try:
-                medspa_agent.tools = await tools_for(tenant_id)
-            except Exception as e2:
-                logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e2}")
-    else:
-        try:
-            medspa_agent.tools = await tools_for(tenant_id)
-        except Exception as e:
-            logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e}")
-
-    # Create input with conversation history
-    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
-    
-    # Run the agent – the default OpenAI client has already been registered
-    result = await Runner.run(medspa_agent, agent_input)
-    
-    # Get the agent response
-    agent_response = result.final_output
-    
-    # Return updated history and response
-    return result.to_input_list(), agent_response 
-
-async def stream_agent_deltas(transcript: str, call_conversation_history: list, tenant_id: str):
-    """
-    Stream the agent response and expose a cancellation handle.
-
-    Returns
-    -------
-    tuple(updated_history_future, async_generator, handle)
-        updated_history_future : asyncio.Future  Resolves to the updated conversation history once the stream completes
-        async_generator        : AsyncGenerator  Yields raw text deltas for TTS
-        handle                 : StreamingHandle object with .cancel() used by VAD
-    """
-    # Load dynamic tools for tenant
-    if MCPServerSse is not None:
-        try:
-            base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
-            server = MCPServerSse(
-                params={"url": f"{base}/sse/"},
-                cache_tools_list=True,
-                name=f"{tenant_id}-mcp",
-            )
-            try:
-                await server.connect()
-            except Exception as conn_exc:
-                logger.error(
-                    f"Failed to connect to MCP server for tenant {tenant_id}: {conn_exc}"
-                )
-                try:
-                    medspa_agent.tools = await tools_for(tenant_id)
-                except Exception as e2:
-                    logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e2}")
-            medspa_agent.mcp_servers = [server]
-        except Exception as e:
-            logger.error(f"Failed to configure MCP server for tenant {tenant_id}: {e}")
-            try:
-                medspa_agent.tools = await tools_for(tenant_id)
-            except Exception as e2:
-                logger.error(f"Failed to fetch tools for tenant {tenant_id}: {e2}")
-
-    # If a server was configured but failed to establish a connection, clear it
-    try:
-        if MCPServerSse is not None and server is not None and not getattr(server, "_connected", True):
-            medspa_agent.mcp_servers.clear()
-    except NameError:
-        # 'server' may not be defined if MCP was not enabled – ignore gracefully.
-        pass
-
-    # Compose the input including history and the latest user message
-    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
-
-    loop = asyncio.get_running_loop()
-    updated_hist_future: asyncio.Future = loop.create_future()
-
-    async def _delta_generator():
-        # 1) Create the streamed run **inside** the consumer coroutine.
-        streaming_result = Runner.run_streamed(
-            medspa_agent,
-            agent_input,
-        )
-
-        # 2) Relay deltas to the caller in real-time.
-        async for event in streaming_result.stream_events():
-            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
-                yield event.data.delta
-
-        # 3) When streaming completes, resolve the history Future so the
-        #    caller can persist.  This happens *after* the final delta to
-        #    guarantee ordering (required for consistent audit trail).
-        try:
-            if not updated_hist_future.done():
-                updated_hist_future.set_result(streaming_result.to_input_list())
-        except Exception as hist_exc:
-            # Never propagate – instead set the original input so that the
-            # caller at least has a consistent baseline.
-            logger.error(f"Failed to build updated history: {hist_exc}")
-            if not updated_hist_future.done():
-                updated_hist_future.set_result(agent_input)
-
-    agen = _delta_generator()
-    handle = StreamingHandle(agen)
-
-    return updated_hist_future, agen, handle
+# ---------------------------------------------------------------------------
+# Legacy SSE transport helpers have been deprecated in favour of the unified
+# HTTP + JSON-RPC transport introduced in MCP 2025-03-26.  All functionality
+# is now provided by the implementation that follows below.
+# ---------------------------------------------------------------------------
 
 async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
     """Initialise and attach a *Streamable HTTP* ``MCPServerHttp`` instance.
@@ -247,7 +111,14 @@ async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
     base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
 
     server = MCPServerHttp(
-        params={"url": f"{base}/mcp"},  # Unified /mcp endpoint per spec
+        params={
+            "url": f"{base}/mcp",  # Unified /mcp endpoint per spec
+            # Mandatory protocol negotiation headers (MCP 2025-03-26 §4.1)
+            "headers": {
+                "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
+                "Accept": "application/json",
+            },
+        },
         cache_tools_list=True,
         name=f"{tenant_id}-mcp-http",
     )
@@ -270,83 +141,86 @@ async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
         # policy.
         raise
 
-async def get_agent_response(transcript, call_conversation_history, tenant_id: str):
-    """
-    Process transcripts with the agent and generate a response.
-    
-    Args:
-        transcript: The transcript text from the user
-        call_conversation_history: The conversation history for this call
-        tenant_id: The ID of the tenant
+# ---------------------------------------------------------------------------
+# Public helpers – consolidated HTTP transport
+# ---------------------------------------------------------------------------
 
-    Returns:
-        tuple: (updated_history, response_text)
-    """
-    logger.info(f"Running medspa agent with input: {transcript}")
 
-  
+async def get_agent_response(
+    transcript: str,
+    call_conversation_history: list,
+    tenant_id: str,
+) -> tuple[list, str]:
+    """Generate a full assistant response using the HTTP+JSON-RPC MCP transport.
 
-    # Refresh MCP/toolbox configuration for this tenant.
-    await _init_mcp_server(medspa_agent, tenant_id)
-
-    # Create input with conversation history
-    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
-    
-    # Run the agent – the default OpenAI client has already been registered
-    result = await Runner.run(medspa_agent, agent_input)
-    
-    # Get the agent response
-    agent_response = result.final_output
-    
-    # Return updated history and response
-    return result.to_input_list(), agent_response 
-
-async def stream_agent_deltas(transcript: str, call_conversation_history: list, tenant_id: str):
-    """
-    Stream the agent response and expose a cancellation handle.
+    Parameters
+    ----------
+    transcript : str
+        The latest user utterance.
+    call_conversation_history : list
+        The existing dialog history for this call (MCP-compliant OpenAI format).
+    tenant_id : str
+        Logical tenant identifier used to isolate tool scopes and auth.
 
     Returns
     -------
-    tuple(updated_history_future, async_generator, handle)
-        updated_history_future : asyncio.Future  Resolves to the updated conversation history once the stream completes
-        async_generator        : AsyncGenerator  Yields raw text deltas for TTS
-        handle                 : StreamingHandle object with .cancel() used by VAD
+    tuple(updated_history, response_text)
+        *updated_history* – The dialog history including the assistant reply
+        *response_text* – The assistant's natural-language response
     """
-    # Refresh MCP/toolbox configuration for this tenant (streaming variant)
+
+    logger.info("Running medspa agent with input: %s", transcript)
+
+    # Ensure up-to-date MCP server configuration for this tenant.
     await _init_mcp_server(medspa_agent, tenant_id)
 
-    # Compose the input including history and the latest user message
-    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
+    agent_input = call_conversation_history + [
+        {"role": "user", "content": transcript},
+    ]
+
+    result = await Runner.run(medspa_agent, agent_input)
+    return result.to_input_list(), result.final_output
+
+
+async def stream_agent_deltas(
+    transcript: str,
+    call_conversation_history: list,
+    tenant_id: str,
+):
+    """Stream assistant deltas for real-time TTS while preserving history.
+
+    The function returns a tuple consisting of:
+
+    1. *updated_history_future* – resolves to the updated chat history once
+       the stream concludes.
+    2. *delta_generator* – async generator that yields str deltas as produced
+       by the LLM.
+    3. *handle* – `StreamingHandle` instance that allows the caller to cancel
+       the in-flight stream (used by VAD).
+    """
+
+    await _init_mcp_server(medspa_agent, tenant_id)
+
+    agent_input = call_conversation_history + [
+        {"role": "user", "content": transcript},
+    ]
 
     loop = asyncio.get_running_loop()
     updated_hist_future: asyncio.Future = loop.create_future()
 
     async def _delta_generator():
-        # 1) Create the streamed run **inside** the consumer coroutine.
-        streaming_result = Runner.run_streamed(
-            medspa_agent,
-            agent_input,
-        )
+        streaming_result = Runner.run_streamed(medspa_agent, agent_input)
 
-        # 2) Relay deltas to the caller in real-time.
         async for event in streaming_result.stream_events():
-            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+            if (
+                event.type == "raw_response_event"
+                and isinstance(event.data, ResponseTextDeltaEvent)
+            ):
                 yield event.data.delta
 
-        # 3) When streaming completes, resolve the history Future so the
-        #    caller can persist.  This happens *after* the final delta to
-        #    guarantee ordering (required for consistent audit trail).
-        try:
-            if not updated_hist_future.done():
-                updated_hist_future.set_result(streaming_result.to_input_list())
-        except Exception as hist_exc:
-            # Never propagate – instead set the original input so that the
-            # caller at least has a consistent baseline.
-            logger.error(f"Failed to build updated history: {hist_exc}")
-            if not updated_hist_future.done():
-                updated_hist_future.set_result(agent_input)
+        # Resolve history promise once stream completes.
+        if not updated_hist_future.done():
+            updated_hist_future.set_result(streaming_result.to_input_list())
 
     agen = _delta_generator()
-    handle = StreamingHandle(agen)
-
-    return updated_hist_future, agen, handle
+    return updated_hist_future, agen, StreamingHandle(agen)

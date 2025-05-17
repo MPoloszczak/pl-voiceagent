@@ -17,3 +17,7 @@ __pycache__/
 # Editor configs (optional – comment out if you want tracked)
 *.vscode/
 mcp_reference
+
+.cursor/
+
+.cursor
