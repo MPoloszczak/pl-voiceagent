@@ -109,7 +109,7 @@ async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
     base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
 
     params: "MCPServerStreamableHttpParams" = {
-        "url": f"{base}/mcp",
+        "url": f"{base}/{tenant_id}/mcp",
         "headers": {
             "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
         },
@@ -128,7 +128,7 @@ async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
             await asyncio.wait_for(server.connect(), timeout=6.0)
         agent.mcp_servers = [server]
         logger.info(
-            f"✅ Connected to MCP HTTP transport for tenant {tenant_id} at {base}/mcp"
+            f"✅ Connected to MCP HTTP transport for tenant {tenant_id} at {base}/{tenant_id}/mcp"
         )
     except Exception as exc:  # noqa: BLE001 – surface failures to caller
         logger.error(

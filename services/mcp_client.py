@@ -1,8 +1,25 @@
 import os
-import httpx
 import json
+import asyncio
 from typing import List
+
 from agents import Tool
+
+# New MCP Streamable HTTP client (OpenAI Agents SDK >= 0.0.15)
+# Fallbacks to dict typing when the SDK is unavailable (CI mocks).
+try:
+    from agents.mcp.server import (
+        MCPServerStreamableHttp,
+        MCPServerStreamableHttpParams,
+    )
+except ImportError:  # pragma: no cover – SDK not available in CI mocks
+    MCPServerStreamableHttp = None  # type: ignore
+    MCPServerStreamableHttpParams = dict  # type: ignore
+
+# MCP spec version header (kept in-sync with oai.MCP_PROTOCOL_VERSION)
+MCP_PROTOCOL_VERSION = "2025-03-26"
+
+import httpx  # retained for backwards-compat TTL caches – not strictly required
 
 # Centralised Redis cache helpers (with TLS + automatic in-memory fallback)
 from services.cache import get_json, set_json
@@ -12,7 +29,7 @@ from services.cache import get_json, set_json
 # encryption in-transit but does not prescribe RTTs – we tune for UX.
 
 _timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=None)
-_client = httpx.AsyncClient(timeout=_timeout, http2=True, follow_redirects=True)
+_client = httpx.AsyncClient(timeout=_timeout, http2=True, follow_redirects=True)  # kept for legacy callers
 
 async def tools_for(tenant: str) -> List[Tool]:
     """Return the tool list for *tenant*.
@@ -46,45 +63,46 @@ async def tools_for(tenant: str) -> List[Tool]:
             )
 
     # -------------------------------------------------------------------
-    # 2) Fetch from MCP service over TLS, then persist to Redis (TTL 15 min)
+    # 2) Fetch via MCP JSON-RPC list_tools call (preferred as of 2025-03-26)
     # -------------------------------------------------------------------
-    base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
 
     async def _remote_fetch() -> List[Tool]:
-        """Fetch toolbox over HTTPS/SSE per MCP best-practices.
+        """Request `list_tools` over the per-tenant Streamable-HTTP endpoint.
 
-        The endpoint *may* emit `text/event-stream` – in that case we read the
-        first `data:` frame (JSON-RPC payload) and immediately close the
-        connection.  This matches the reference FastMCP implementation and
-        avoids holding an open stream longer than needed (least-privilege &
-        resource stewardship – HIPAA §164.308(a)(3)(i)).
+        The OpenAI Agents SDK >= 0.0.15 transparently handles JSON-RPC framing
+        and optional SSE upgrades, ensuring full compliance with the 2025-03-26
+        MCP specification.  We prefer this over custom HTTP clients now that
+        the legacy `/toolbox.json` endpoint has been removed.
         """
 
-        url = f"{base.rstrip('/')}/{tenant}/toolbox.json"
+        if MCPServerStreamableHttp is None:
+            raise RuntimeError("MCPStreamableHttp class unavailable – cannot fetch tools list")
 
-        headers = {"Accept": "application/json, text/event-stream"}
+        base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
 
-        async with _client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
-            resp.raise_for_status()
+        params: "MCPServerStreamableHttpParams" = {
+            "url": f"{base}/{tenant}/mcp",
+            "headers": {"Mcp-Protocol-Version": MCP_PROTOCOL_VERSION},
+        }
 
-            ctype = resp.headers.get("content-type", "")
+        server = MCPServerStreamableHttp(
+            params=params,
+            cache_tools_list=False,  # We handle our own Redis cache
+            name=f"{tenant}-tools-http",
+        )
 
-            if "text/event-stream" in ctype:
-                # Iterate until first `data:` frame.
-                async for line in resp.aiter_lines():
-                    if not line or line.startswith(":"):
-                        # comment / heartbeat per SSE spec
-                        continue
-                    if line.startswith("data:"):
-                        payload = line[len("data:"):].strip()
-                        data = json.loads(payload)
-                        return [Tool(**item) for item in data]
-
-                raise ValueError("SSE stream closed before toolbox payload received")
-
-            # Non-SSE JSON response.
-            data = await resp.json()
-            return [Tool(**item) for item in data]
+        try:
+            # Perform the JSON-RPC call with a short timeout (6s prevents UX lag)
+            tools: List[Tool] = await asyncio.wait_for(server.list_tools(), timeout=6.0)
+            return tools
+        finally:
+            # Explicitly close underlying HTTP session if SDK exposes it
+            aclose = getattr(server, "aclose", None)
+            if asyncio.iscoroutinefunction(aclose):
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001 – non-fatal cleanup
+                    pass
 
     try:
         tools = await _remote_fetch()
