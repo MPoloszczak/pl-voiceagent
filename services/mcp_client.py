@@ -82,7 +82,10 @@ async def tools_for(tenant: str) -> List[Tool]:
 
         params: "MCPServerStreamableHttpParams" = {
             "url": f"{base}/{tenant}/mcp",
-            "headers": {"Mcp-Protocol-Version": MCP_PROTOCOL_VERSION},
+            "headers": {
+                "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
+                "Mcp-Session-Id": None,
+            },
         }
 
         server = MCPServerStreamableHttp(

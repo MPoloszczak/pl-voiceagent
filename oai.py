@@ -112,6 +112,7 @@ async def _init_mcp_server(agent: Agent, tenant_id: str) -> None:
         "url": f"{base}/{tenant_id}/mcp",
         "headers": {
             "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
+            "Mcp-Session-Id": None,
         },
     }
 
