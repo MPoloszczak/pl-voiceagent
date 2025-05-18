@@ -93,12 +93,16 @@ async def _init_mcp_server(agent: Agent, tenant_id: str, session_id: Optional[st
     can respond appropriately (in accordance with the "no fallbacks" policy).
     """
 
+    logger.info("MCP init: tenant=%s, session=%s", tenant_id, session_id)
+    
     # Remove any previous server registration to avoid stale handles across
     # multiple tenant invocations within the same process.
     try:
+        logger.debug("Clearing existing MCP servers for agent")
         agent.mcp_servers.clear()  # type: ignore[attr-defined]
+        logger.debug("Existing MCP servers cleared")
     except AttributeError:
-        pass
+        logger.debug("No existing MCP servers to clear")
 
 
     if MCPServerStreamableHttp is None:
@@ -108,6 +112,7 @@ async def _init_mcp_server(agent: Agent, tenant_id: str, session_id: Optional[st
         raise RuntimeError("MCP HTTP transport unavailable in current runtime")
 
     base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
+    logger.debug("MCP base URL: %s", base)
 
     headers = {
         "Accept": "text/event-stream",
@@ -117,30 +122,34 @@ async def _init_mcp_server(agent: Agent, tenant_id: str, session_id: Optional[st
         "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
         "MCP-Session-Id": session_id,
     }
+    logger.debug("MCP init headers: %s", headers)
     params: "MCPServerStreamableHttpParams" = {
         "url": f"{base}/{tenant_id}/mcp",
         "headers": headers,
     }
+    logger.debug("MCP init params: %s", params)
+    logger.info("Creating MCPServerStreamableHttp for tenant %s at URL %s", tenant_id, params["url"])
 
     server = MCPServerStreamableHttp(
         params=params,
         cache_tools_list=True,
         name=f"{tenant_id}-mcp-http",
     )
+    logger.debug("MCPServerStreamableHttp instance created: %r", server)
 
     # Some SDK versions expose an async connect(); use it when present to
     # perform eager endpoint discovery and auth validation.
     try:
         if hasattr(server, "connect") and asyncio.iscoroutinefunction(server.connect):
+            logger.info("Attempting connection to MCP server for tenant %s", tenant_id)
             await asyncio.wait_for(server.connect(), timeout=6.0)
+            logger.info("MCP server.connect() completed for tenant %s", tenant_id)
         agent.mcp_servers = [server]
         logger.info(
-            f"✅ Connected to MCP HTTP transport for tenant {tenant_id} at {base}/{tenant_id}/mcp"
+            "✅ Connected to MCP HTTP transport for tenant %s at %s/%s/mcp", tenant_id, base, tenant_id
         )
     except Exception as exc:  # noqa: BLE001 – surface failures to caller
-        logger.error(
-            f"❌ Failed to initialise MCP HTTP transport for tenant {tenant_id}: {exc}"
-        )
+        logger.exception("❌ Failed to initialise MCP HTTP transport for tenant %s", tenant_id)
         # Propagate – the caller may choose to handle this, but we do *not*
         # fall back to alternative transports to respect the no-fallback
         # policy.

@@ -47,6 +47,7 @@ async def tools_for(tenant: str) -> List[Tool]:
     """
 
     from utils import logger  # local import to avoid cycles
+    logger.info("tools_for: fetching tools for tenant %s", tenant)
 
     cache_key = f"mcp:tenant:{tenant}:tools"
 
@@ -92,16 +93,23 @@ async def tools_for(tenant: str) -> List[Tool]:
             },
         }
 
+        logger.info("MCP remote fetch init for tenant %s: url=%s, headers=%s", tenant, params["url"], params["headers"])
         server = MCPServerStreamableHttp(
             params=params,
             cache_tools_list=False,  # We handle our own Redis cache
             name=f"{tenant}-tools-http",
         )
 
+        logger.debug("MCPServerStreamableHttp instance created: %r", server)
         try:
-            # Perform the JSON-RPC call with a short timeout (6s prevents UX lag)
+            logger.info("Sending list_tools JSON-RPC request for tenant %s", tenant)
             tools: List[Tool] = await asyncio.wait_for(server.list_tools(), timeout=6.0)
+            logger.info("Received %d tools from MCP for tenant %s", len(tools), tenant)
+            logger.debug("Tools payload: %s", tools)
             return tools
+        except Exception as exc:
+            logger.exception("Exception during list_tools for tenant %s", tenant)
+            raise
         finally:
             # Explicitly close underlying HTTP session if SDK exposes it
             aclose = getattr(server, "aclose", None)
