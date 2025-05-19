@@ -82,7 +82,7 @@ async def tools_for(tenant: str) -> List[Tool]:
         base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
 
         params: "MCPServerStreamableHttpParams" = {
-            "url": f"{base}/{tenant}/mcp",
+            "url": f"{base}/{tenant}/mcp/",
             "headers": {
                 "Accept": "text/event-stream",
                 "Cache-Control": "no-cache",
