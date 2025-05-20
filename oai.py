@@ -106,27 +106,40 @@ async def get_agent_response(
         *response_text* – The assistant's natural-language response
     """
 
-    # Compose the MCP transport URL for this tenant
+    # Initialize MCP client for this tenant
+    logger.info("[MCP] Initializing for tenant '%s'", tenant_id)
     base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
     transport_url = f"{base}/{tenant_id}/mcp"
+    logger.debug("[MCP] Base URL: %s", base)
+    logger.debug("[MCP] Full transport URL: %s", transport_url)
     # Prepare messages for the agent
     agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
     # Connect to MCP server and dynamically load tools for this tenant
     async with Client(transport=transport_url) as mcp_client:
-        # Ensure connection established
-        logger.debug("Pinging MCP server for tenant '%s' at %s", tenant_id, transport_url)
-        await mcp_client.ping()
-        logger.debug("MCP server reachable for tenant '%s'", tenant_id)
+        logger.info("[MCP] Opening connection to server at %s", transport_url)
+        try:
+            logger.debug("[MCP] Sending ping for tenant '%s'", tenant_id)
+            await mcp_client.ping()
+            logger.info("[MCP] Ping successful for tenant '%s'", tenant_id)
+        except Exception as e:
+            logger.error("[MCP] Ping failed for tenant '%s': %s", tenant_id, e)
+            raise
         # Retrieve available tools
+        logger.info("[MCP] Listing tools for tenant '%s'", tenant_id)
         mcp_tools = await mcp_client.list_tools()
+        logger.info("[MCP] Retrieved %d tools for tenant '%s'", len(mcp_tools), tenant_id)
         # Convert MCP tools into FunctionTools
         function_tools: list[FunctionTool] = []
+        logger.debug("[MCP] Converting MCP tools to FunctionTool objects")
         for tool in mcp_tools:
+            logger.debug("[MCP] Converting tool '%s'", tool.name)
             name = tool.name
             # Some MCP servers may provide description or docs
             description = getattr(tool, 'description', '') or name
+            logger.debug("[MCP] Tool '%s' description: '%s'", name, description)
             # Use provided JSON schema if available
             params_schema = getattr(tool, 'params_json_schema', None) or getattr(tool, 'schema', None)
+            logger.debug("[MCP] Tool '%s' schema: %s", name, params_schema)
             # Create invocation function that calls MCP tool
             async def _invoke(ctx, args_json: str, _name=name, _mcp=mcp_client):
                 params = json.loads(args_json)
@@ -137,7 +150,7 @@ async def get_agent_response(
                     if hasattr(content, 'text'):
                         texts.append(content.text)
                 return ''.join(texts)
-            # Build the FunctionTool
+            # Build and collect the FunctionTool
             function_tools.append(
                 FunctionTool(
                     name=name,
@@ -146,10 +159,11 @@ async def get_agent_response(
                     on_invoke_tool=_invoke,
                 )
             )
-        # Attach tools to the agent for this run
-        medspa_agent.tools = function_tools
+        logger.info("[MCP] Attached %d FunctionTools to medspa_agent for tenant '%s'", len(function_tools), tenant_id)
         # Run the agent loop with tools enabled
+        logger.info("[MCP] Invoking agent run for tenant '%s'", tenant_id)
         result = await Runner.run(medspa_agent, agent_input)
+        logger.info("[MCP] Agent run complete for tenant '%s'", tenant_id)
         return result.to_input_list(), result.final_output
 
 
@@ -181,14 +195,25 @@ async def stream_agent_deltas(
         # Compose the MCP transport URL for this tenant
         base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
         transport_url = f"{base}/{tenant_id}/mcp"
+        logger.debug("[MCP-STREAM] Base URL: %s", base)
+        logger.debug("[MCP-STREAM] Full transport URL: %s", transport_url)
         # Connect to MCP server and dynamically load tools
         async with Client(transport=transport_url) as mcp_client:
+            logger.info("[MCP-STREAM] Opening connection for tenant '%s'", tenant_id)
             logger.debug("Pinging MCP server for tenant '%s' at %s", tenant_id, transport_url)
-            await mcp_client.ping()
-            logger.debug("MCP server reachable for tenant '%s'", tenant_id)
+            try:
+                logger.debug("[MCP-STREAM] Sending ping for tenant '%s'", tenant_id)
+                await mcp_client.ping()
+                logger.info("[MCP-STREAM] Ping successful for tenant '%s'", tenant_id)
+            except Exception as e:
+                logger.error("[MCP-STREAM] Ping failed for tenant '%s': %s", tenant_id, e)
+                raise
             mcp_tools = await mcp_client.list_tools()
+            logger.info("[MCP-STREAM] Retrieved %d tools for tenant '%s'", len(mcp_tools), tenant_id)
             function_tools: list[FunctionTool] = []
+            logger.debug("[MCP-STREAM] Converting MCP tools to FunctionTool objects")
             for tool in mcp_tools:
+                logger.debug("[MCP-STREAM] Converting tool '%s'", tool.name)
                 name = tool.name
                 description = getattr(tool, 'description', '') or name
                 params_schema = getattr(tool, 'params_json_schema', None) or getattr(tool, 'schema', None)
@@ -208,8 +233,10 @@ async def stream_agent_deltas(
                         on_invoke_tool=_invoke,
                     )
                 )
+            logger.info("[MCP-STREAM] Attaching %d FunctionTools to medspa_agent for tenant '%s'", len(function_tools), tenant_id)
             # Attach tools to the agent for streaming run
             medspa_agent.tools = function_tools
+            logger.info("[MCP-STREAM] Starting streaming agent run for tenant '%s'", tenant_id)
             # Execute streaming agent with dynamic tools
             streaming_result = Runner.run_streamed(medspa_agent, agent_input)
             async for event in streaming_result.stream_events():
