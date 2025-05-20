@@ -2,28 +2,18 @@ import asyncio
 import httpx
 from openai import AsyncOpenAI
 from typing import Optional
-
 from agents import Agent, Runner, set_default_openai_client
 from openai.types.responses import ResponseTextDeltaEvent
-
 from utils import logger
-# Dynamic MCP integration per tenant
 import os
+from agents.mcp.server import MCPServerStreamableHttp, MCPServerStreamableHttpParams
 
 
-try:
-    from agents.mcp.server import (
-        MCPServerStreamableHttp,
-        MCPServerStreamableHttpParams,
-    )
-except ImportError:  # pragma: no cover – SDK not available in CI mocks
-    MCPServerStreamableHttp = None  # type: ignore
-    MCPServerStreamableHttpParams = dict  # type: ignore
+
 
 # Protocol version header used for all outbound MCP requests.
 MCP_PROTOCOL_VERSION = "2025-03-26"
 
-from services.mcp_client import tools_for
 
 # ------------------------------------------------------------------
 # Single Medspa assistant agent (dynamic toolbox set per-tenant)
@@ -124,7 +114,7 @@ async def _init_mcp_server(agent: Agent, tenant_id: str, session_id: Optional[st
     }
     logger.debug("MCP init headers: %s", headers)
     params: "MCPServerStreamableHttpParams" = {
-        "url": f"{base}/{tenant_id}/mcp",
+        "url": f"{base}/{tenant_id}",
         "headers": headers,
     }
     logger.debug("MCP init params: %s", params)
