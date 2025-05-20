@@ -114,7 +114,7 @@ async def _init_mcp_server(agent: Agent, tenant_id: str, session_id: Optional[st
     }
     logger.debug("MCP init headers: %s", headers)
     params: "MCPServerStreamableHttpParams" = {
-        "url": f"{base}/{tenant_id}",
+        "url": f"{base}/{tenant_id}/mcp",
         "headers": headers,
     }
     logger.debug("MCP init params: %s", params)
