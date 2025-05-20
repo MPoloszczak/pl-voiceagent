@@ -2,17 +2,17 @@ import asyncio
 import httpx
 from openai import AsyncOpenAI
 from typing import Optional
-from agents import Agent, Runner, set_default_openai_client
+from agents import Agent, Runner, set_default_openai_client, FunctionTool
 from openai.types.responses import ResponseTextDeltaEvent
 from utils import logger
 import os
-from agents.mcp.server import MCPServerStreamableHttp, MCPServerStreamableHttpParams
+from fastmcp import Client, FastMCP
+import json
 
 
 
 
-# Protocol version header used for all outbound MCP requests.
-MCP_PROTOCOL_VERSION = "2025-03-26"
+
 
 
 # ------------------------------------------------------------------
@@ -70,85 +70,15 @@ class StreamingHandle:
             pass
 
 
-async def _init_mcp_server(agent: Agent, tenant_id: str, session_id: Optional[str] = None) -> None:
-    """Initialise and attach a *Streamable HTTP* ``MCPServerStreamableHttp`` instance.
 
-    As recommended by the 2025-03-26 MCP specification (§3.1.4), we prefer the
-    consolidated HTTP+JSON-RPC transport which optionally upgrades to SSE for
-    streaming.  This approach eliminates the task-group race condition present
-    in the legacy SSE-only client implementation (see Anthropic Agents SDK
-    issue #1390) and therefore provides a more robust connection strategy for
-    latency-sensitive ECS workloads.  No alternative transports are attempted:
-    if the HTTP initialisation fails we propagate the error so that the caller
-    can respond appropriately (in accordance with the "no fallbacks" policy).
-    """
-
-    logger.info("MCP init: tenant=%s, session=%s", tenant_id, session_id)
-    
-    # Remove any previous server registration to avoid stale handles across
-    # multiple tenant invocations within the same process.
-    try:
-        logger.debug("Clearing existing MCP servers for agent")
-        agent.mcp_servers.clear()  # type: ignore[attr-defined]
-        logger.debug("Existing MCP servers cleared")
-    except AttributeError:
-        logger.debug("No existing MCP servers to clear")
-
-
-    if MCPServerStreamableHttp is None:
-        logger.error(
-            "MCPServerStreamableHttp class not available – cannot initialise MCP HTTP transport."
-        )
-        raise RuntimeError("MCP HTTP transport unavailable in current runtime")
-
-    base = os.getenv("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
-    logger.debug("MCP base URL: %s", base)
-
-    headers = {
-        "Accept": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Content-Type": "application/json",
-        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
-        "MCP-Session-Id": session_id,
-    }
-    logger.debug("MCP init headers: %s", headers)
-    params: "MCPServerStreamableHttpParams" = {
-        "url": f"{base}/{tenant_id}/mcp",
-        "headers": headers,
-    }
-    logger.debug("MCP init params: %s", params)
-    logger.info("Creating MCPServerStreamableHttp for tenant %s at URL %s", tenant_id, params["url"])
-
-    server = MCPServerStreamableHttp(
-        params=params,
-        cache_tools_list=True,
-        name=f"{tenant_id}-mcp-http",
-    )
-    logger.debug("MCPServerStreamableHttp instance created: %r", server)
-
-    # Some SDK versions expose an async connect(); use it when present to
-    # perform eager endpoint discovery and auth validation.
-    try:
-        if hasattr(server, "connect") and asyncio.iscoroutinefunction(server.connect):
-            logger.info("Attempting connection to MCP server for tenant %s", tenant_id)
-            await asyncio.wait_for(server.connect(), timeout=6.0)
-            logger.info("MCP server.connect() completed for tenant %s", tenant_id)
-        agent.mcp_servers = [server]
-        logger.info(
-            "✅ Connected to MCP HTTP transport for tenant %s at %s/%s/mcp", tenant_id, base, tenant_id
-        )
-    except Exception as exc:  # noqa: BLE001 – surface failures to caller
-        logger.exception("❌ Failed to initialise MCP HTTP transport for tenant %s", tenant_id)
-        # Propagate – the caller may choose to handle this, but we do *not*
-        # fall back to alternative transports to respect the no-fallback
-        # policy.
-        raise
 
 # ---------------------------------------------------------------------------
 # Public helpers – consolidated HTTP transport
 # ---------------------------------------------------------------------------
 
+
+# Model Context Protocol version header for MCP requests, used by HTTP transport
+MCP_PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-03-26")
 
 async def get_agent_response(
     transcript: str,
@@ -176,17 +106,51 @@ async def get_agent_response(
         *response_text* – The assistant's natural-language response
     """
 
-    logger.info("Running medspa agent with input: %s", transcript)
-
-    # Ensure up-to-date MCP server configuration for this tenant.
-    await _init_mcp_server(medspa_agent, tenant_id, session_id)
-
-    agent_input = call_conversation_history + [
-        {"role": "user", "content": transcript},
-    ]
-
-    result = await Runner.run(medspa_agent, agent_input)
-    return result.to_input_list(), result.final_output
+    # Compose the MCP transport URL for this tenant
+    base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
+    transport_url = f"{base}/{tenant_id}/mcp"
+    # Prepare messages for the agent
+    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
+    # Connect to MCP server and dynamically load tools for this tenant
+    async with Client(transport=transport_url) as mcp_client:
+        # Ensure connection established
+        logger.debug("Pinging MCP server for tenant '%s' at %s", tenant_id, transport_url)
+        await mcp_client.ping()
+        logger.debug("MCP server reachable for tenant '%s'", tenant_id)
+        # Retrieve available tools
+        mcp_tools = await mcp_client.list_tools()
+        # Convert MCP tools into FunctionTools
+        function_tools: list[FunctionTool] = []
+        for tool in mcp_tools:
+            name = tool.name
+            # Some MCP servers may provide description or docs
+            description = getattr(tool, 'description', '') or name
+            # Use provided JSON schema if available
+            params_schema = getattr(tool, 'params_json_schema', None) or getattr(tool, 'schema', None)
+            # Create invocation function that calls MCP tool
+            async def _invoke(ctx, args_json: str, _name=name, _mcp=mcp_client):
+                params = json.loads(args_json)
+                results = await _mcp.call_tool(_name, params)
+                # Concatenate text outputs
+                texts = []
+                for content in results:
+                    if hasattr(content, 'text'):
+                        texts.append(content.text)
+                return ''.join(texts)
+            # Build the FunctionTool
+            function_tools.append(
+                FunctionTool(
+                    name=name,
+                    description=description,
+                    params_json_schema=params_schema,
+                    on_invoke_tool=_invoke,
+                )
+            )
+        # Attach tools to the agent for this run
+        medspa_agent.tools = function_tools
+        # Run the agent loop with tools enabled
+        result = await Runner.run(medspa_agent, agent_input)
+        return result.to_input_list(), result.final_output
 
 
 async def stream_agent_deltas(
@@ -207,28 +171,55 @@ async def stream_agent_deltas(
        the in-flight stream (used by VAD).
     """
 
-    await _init_mcp_server(medspa_agent, tenant_id, session_id)
-
-    agent_input = call_conversation_history + [
-        {"role": "user", "content": transcript},
-    ]
+    # Prepare messages for the agent
+    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
 
     loop = asyncio.get_running_loop()
     updated_hist_future: asyncio.Future = loop.create_future()
 
     async def _delta_generator():
-        streaming_result = Runner.run_streamed(medspa_agent, agent_input)
-
-        async for event in streaming_result.stream_events():
-            if (
-                event.type == "raw_response_event"
-                and isinstance(event.data, ResponseTextDeltaEvent)
-            ):
-                yield event.data.delta
-
-        # Resolve history promise once stream completes.
-        if not updated_hist_future.done():
-            updated_hist_future.set_result(streaming_result.to_input_list())
+        # Compose the MCP transport URL for this tenant
+        base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
+        transport_url = f"{base}/{tenant_id}/mcp"
+        # Connect to MCP server and dynamically load tools
+        async with Client(transport=transport_url) as mcp_client:
+            logger.debug("Pinging MCP server for tenant '%s' at %s", tenant_id, transport_url)
+            await mcp_client.ping()
+            logger.debug("MCP server reachable for tenant '%s'", tenant_id)
+            mcp_tools = await mcp_client.list_tools()
+            function_tools: list[FunctionTool] = []
+            for tool in mcp_tools:
+                name = tool.name
+                description = getattr(tool, 'description', '') or name
+                params_schema = getattr(tool, 'params_json_schema', None) or getattr(tool, 'schema', None)
+                async def _invoke(ctx, args_json: str, _name=name, _mcp=mcp_client):
+                    params = json.loads(args_json)
+                    results = await _mcp.call_tool(_name, params)
+                    texts = []
+                    for content in results:
+                        if hasattr(content, 'text'):
+                            texts.append(content.text)
+                    return ''.join(texts)
+                function_tools.append(
+                    FunctionTool(
+                        name=name,
+                        description=description,
+                        params_json_schema=params_schema,
+                        on_invoke_tool=_invoke,
+                    )
+                )
+            # Attach tools to the agent for streaming run
+            medspa_agent.tools = function_tools
+            # Execute streaming agent with dynamic tools
+            streaming_result = Runner.run_streamed(medspa_agent, agent_input)
+            async for event in streaming_result.stream_events():
+                if (
+                    event.type == "raw_response_event"
+                    and isinstance(event.data, ResponseTextDeltaEvent)
+                ):
+                    yield event.data.delta
+            if not updated_hist_future.done():
+                updated_hist_future.set_result(streaming_result.to_input_list())
 
     agen = _delta_generator()
     return updated_hist_future, agen, StreamingHandle(agen)
