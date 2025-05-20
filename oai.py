@@ -7,6 +7,7 @@ from openai.types.responses import ResponseTextDeltaEvent
 from utils import logger
 import os
 from fastmcp import Client, FastMCP
+from urllib.parse import urlparse
 import json
 
 
@@ -108,10 +109,12 @@ async def get_agent_response(
 
     # Initialize MCP client for this tenant
     logger.info("[MCP] Initializing for tenant '%s'", tenant_id)
-    base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
-    transport_url = f"{base}/{tenant_id}/mcp"
-    logger.debug("[MCP] Base URL: %s", base)
-    logger.debug("[MCP] Full transport URL: %s", transport_url)
+    # Enforce HTTPS and port 443 only
+    raw_base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
+    parsed = urlparse(raw_base)
+    hostname = parsed.hostname or raw_base
+    transport_url = f"https://{hostname}:443/{tenant_id}/mcp"
+    logger.debug("[MCP] Enforced HTTPS on port 443; transport_url: %s", transport_url)
     # Prepare messages for the agent
     agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
     # Connect to MCP server and dynamically load tools for this tenant
@@ -192,11 +195,12 @@ async def stream_agent_deltas(
     updated_hist_future: asyncio.Future = loop.create_future()
 
     async def _delta_generator():
-        # Compose the MCP transport URL for this tenant
-        base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
-        transport_url = f"{base}/{tenant_id}/mcp"
-        logger.debug("[MCP-STREAM] Base URL: %s", base)
-        logger.debug("[MCP-STREAM] Full transport URL: %s", transport_url)
+        # Enforce HTTPS and port 443 only for streaming
+        raw_base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
+        parsed = urlparse(raw_base)
+        hostname = parsed.hostname or raw_base
+        transport_url = f"https://{hostname}:443/{tenant_id}/mcp"
+        logger.debug("[MCP-STREAM] Enforced HTTPS on port 443; transport_url: %s", transport_url)
         # Connect to MCP server and dynamically load tools
         async with Client(transport=transport_url) as mcp_client:
             logger.info("[MCP-STREAM] Opening connection for tenant '%s'", tenant_id)
