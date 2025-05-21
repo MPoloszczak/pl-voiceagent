@@ -7,14 +7,23 @@ from openai.types.responses import ResponseTextDeltaEvent
 from utils import logger
 import os
 from fastmcp import Client, FastMCP
+from fastmcp.client.logging import LogMessage
 from urllib.parse import urlparse
 import json
 
+##MCP Configuration------------------------------------------------
+# Define a handler for server-emitted logs per FastMCP advanced features
+async def log_handler(message: LogMessage):
+    level = message.level.upper()
+    logger_name = message.logger or 'default'
+    data = message.data
+    print(f"[Server Log - {level}] {logger_name}: {data}")
 
-
-
-
-
+# Initialize the FastMCP client for MCP interactions, enabling streamable HTTP transport and logs
+pl_mcp = Client(
+    transport="https://mcp.pololabsai.com/mcp/",
+    log_handler=log_handler
+)
 
 # ------------------------------------------------------------------
 # Single Medspa assistant agent (dynamic toolbox set per-tenant)
@@ -41,13 +50,12 @@ When responding to the user:
 
 Remember to be conversational, not corporate. Make the user feel valued and understood.
 """,
-    model="gpt-4o"
+    model="gpt-4o",
+    mcp_servers=[pl_mcp],
 )
 
 
-_httpx_client: httpx.AsyncClient = httpx.AsyncClient()
-
-
+_httpx_client = httpx.AsyncClient()
 _oai_client: AsyncOpenAI = AsyncOpenAI(http_client=_httpx_client)
 
 # Register the client once for the entire process (thread-safe).
@@ -112,9 +120,11 @@ async def get_agent_response(
     # Enforce HTTPS and port 443 only
     raw_base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
     parsed = urlparse(raw_base)
-    hostname = parsed.hostname or raw_base
-    transport_url = f"https://{hostname}:443/{tenant_id}/mcp"
-    logger.debug("[MCP] Enforced HTTPS on port 443; transport_url: %s", transport_url)
+    # Construct Streamable HTTP transport URL with tenant-specific path and trailing slash
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or parsed.path
+    transport_url = f"{scheme}://{netloc}/{tenant_id}/mcp/"
+    logger.debug("[MCP] Using Streamable HTTP transport URL: %s", transport_url)
     # Prepare messages for the agent
     agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
     # Connect to MCP server and dynamically load tools for this tenant
@@ -198,9 +208,11 @@ async def stream_agent_deltas(
         # Enforce HTTPS and port 443 only for streaming
         raw_base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
         parsed = urlparse(raw_base)
-        hostname = parsed.hostname or raw_base
-        transport_url = f"https://{hostname}:443/{tenant_id}/mcp"
-        logger.debug("[MCP-STREAM] Enforced HTTPS on port 443; transport_url: %s", transport_url)
+        # Construct Streamable HTTP transport URL with tenant-specific path and trailing slash
+        scheme = parsed.scheme or "https"
+        netloc = parsed.netloc or parsed.path
+        transport_url = f"{scheme}://{netloc}/{tenant_id}/mcp/"
+        logger.debug("[MCP-STREAM] Using Streamable HTTP transport URL: %s", transport_url)
         # Connect to MCP server and dynamically load tools
         async with Client(transport=transport_url) as mcp_client:
             logger.info("[MCP-STREAM] Opening connection for tenant '%s'", tenant_id)
