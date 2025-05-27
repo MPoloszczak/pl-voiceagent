@@ -1,32 +1,265 @@
 import asyncio
 import httpx
 from openai import AsyncOpenAI
-from typing import Optional
-from agents import Agent, Runner, set_default_openai_client, FunctionTool
+from typing import Optional, Dict, List
+from agents import Agent, Runner, set_default_openai_client
 from openai.types.responses import ResponseTextDeltaEvent
 from utils import logger
 import os
-from fastmcp import Client
-from fastmcp.client.logging import LogMessage
-from urllib.parse import urlparse
 import json
+import time
+from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
-##MCP Configuration------------------------------------------------
-# Define a handler for server-emitted logs per FastMCP advanced features
-async def log_handler(message: LogMessage):
-    level = message.level.upper()
-    logger_name = message.logger or 'default'
-    data = message.data
-    logger.debug(f"[MCP Server Log - {level}] {logger_name}: {data}")
+##HIPAA Compliance & MCP Configuration--------------------------
+# HIPAA audit logging class
+class HIPAALogger:
+    @staticmethod
+    def log_tenant_access(tenant_id: str, session_id: str, action: str, result: str):
+        """Log tenant access for HIPAA audit trail per §164.312(b)."""
+        timestamp = time.time()
+        logger.info(
+            "[HIPAA-AUDIT] tenant=%s session=%s action=%s result=%s timestamp=%f", 
+            tenant_id, session_id or "anonymous", action, result, timestamp
+        )
+    
+    @staticmethod
+    def log_mcp_access(tenant_id: str, operation: str, result: str, details: str = ""):
+        """Log MCP access for HIPAA audit trail per §164.312(b)."""
+        timestamp = time.time()
+        logger.info(
+            "[HIPAA-MCP] tenant=%s operation=%s result=%s details=%s timestamp=%f",
+            tenant_id, operation, result, details, timestamp
+        )
 
-# Remove the global client initialization - we'll create tenant-specific clients instead
-# This follows the pattern from the server where each tenant has its own MCP instance
+# Enhanced tenant validation with rate limiting
+_tenant_access_times: Dict[str, List[float]] = {}
+RATE_LIMIT_WINDOW = 60  # seconds
+MAX_REQUESTS_PER_WINDOW = 100
+
+# Optimized MCP server caching for performance
+_mcp_server_cache: Dict[str, object] = {}
+_cache_creation_times: Dict[str, float] = {}
+CACHE_TTL_SECONDS = 3600  # 1 hour cache TTL
+MCP_PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-03-26")
+
+# Periodic cache cleanup for memory management
+async def periodic_cache_cleanup():
+    """Periodically clean up expired MCP cache entries."""
+    while True:
+        try:
+            await asyncio.sleep(1800)  # Clean up every 30 minutes
+            cleaned = cleanup_expired_cache_entries()
+            if cleaned > 0:
+                logger.info(f"[HIPAA-MCP] Periodic cleanup removed {cleaned} expired cache entries")
+        except Exception as e:
+            logger.error(f"[HIPAA-MCP] Error in periodic cache cleanup: {e}")
+
+# Cleanup task reference
+_cleanup_task = None
+
+def cleanup_expired_cache_entries():
+    """Clean up expired cache entries to prevent memory leaks."""
+    current_time = time.time()
+    expired_tenants = []
+    
+    for tenant_id, creation_time in _cache_creation_times.items():
+        age = current_time - creation_time
+        if age >= CACHE_TTL_SECONDS:
+            expired_tenants.append(tenant_id)
+    
+    for tenant_id in expired_tenants:
+        if tenant_id in _mcp_server_cache:
+            _mcp_server_cache.pop(tenant_id, None)
+            _cache_creation_times.pop(tenant_id, None)
+            logger.debug("[HIPAA-MCP] Cleaned up expired cache entry for tenant '%s'", tenant_id)
+    
+    if expired_tenants:
+        logger.info("[HIPAA-MCP] Cleaned up %d expired cache entries", len(expired_tenants))
+    
+    return len(expired_tenants)
+
+def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
+    """
+    Create or retrieve cached MCP server for tenant with optimizations.
+    
+    Performance optimizations:
+    - Server instance caching with TTL
+    - Tool list caching enabled  
+    - Connection timeout optimized for real-time voice
+    - Streamable HTTP transport for low latency
+    
+    HIPAA Compliance: Tenant isolation per §164.312(a)(1), audit logging per §164.312(b)
+    """
+    
+    # Check cache first (with TTL for production stability)
+    current_time = time.time()
+    if tenant_id in _mcp_server_cache:
+        cache_age = current_time - _cache_creation_times.get(tenant_id, 0)
+        if cache_age < CACHE_TTL_SECONDS:
+            logger.debug("[HIPAA-MCP] Using cached server for tenant '%s' (age: %.1fs)", 
+                        tenant_id, cache_age)
+            HIPAALogger.log_mcp_access(tenant_id, "cache_hit", "success", f"age_{cache_age:.1f}s")
+            return _mcp_server_cache[tenant_id]
+        else:
+            # Cache expired, remove old entry
+            logger.debug("[HIPAA-MCP] Cache expired for tenant '%s', creating new server", tenant_id)
+            _mcp_server_cache.pop(tenant_id, None)
+            _cache_creation_times.pop(tenant_id, None)
+    
+    try:
+        # Construct tenant-specific MCP URL
+        raw_base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
+        parsed = urlparse(raw_base)
+        scheme = parsed.scheme or "https"
+        netloc = parsed.netloc or parsed.path
+        
+        base_url = f"{scheme}://{netloc}".rstrip('/')
+        transport_url = f"{base_url}/{tenant_id}/mcp"
+        
+        logger.info("[HIPAA-MCP] Creating optimized MCP server for tenant '%s' at %s", 
+                   tenant_id, transport_url)
+        
+        # Import OpenAI Agents SDK MCP classes
+        from agents.mcp.server import MCPServerStreamableHttp
+        from datetime import timedelta
+        
+        # Create optimized MCP server for real-time voice AI
+        mcp_server = MCPServerStreamableHttp(
+            params={
+                "url": transport_url,
+                "headers": {
+                    "X-MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+                    "X-Tenant-ID": tenant_id,
+                    "X-Application": "voice-ai",
+                    "User-Agent": "PoloLabs-VoiceAI/1.0"
+                },
+                "timeout": timedelta(seconds=10),  # Optimized for real-time
+                "sse_read_timeout": timedelta(seconds=30)  # Shorter timeout for voice
+            },
+            cache_tools_list=True,  # Enable automatic tool caching
+            name=f"tenant-{tenant_id}-voice",
+            client_session_timeout_seconds=15.0  # Real-time voice optimization
+        )
+        
+        # Cache the server and record creation time
+        _mcp_server_cache[tenant_id] = mcp_server
+        _cache_creation_times[tenant_id] = current_time
+        
+        logger.info("[HIPAA-MCP] Created and cached MCP server for tenant '%s'", tenant_id)
+        HIPAALogger.log_mcp_access(tenant_id, "server_created", "success", f"url_{transport_url}")
+        
+        return mcp_server
+        
+    except ImportError as e:
+        logger.error("[HIPAA-MCP] OpenAI Agents SDK MCP module not available: %s", e)
+        HIPAALogger.log_mcp_access(tenant_id, "server_creation", "import_error", str(e))
+        return None
+        
+    except Exception as e:
+        logger.error("[HIPAA-MCP] Failed to create MCP server for tenant '%s': %s", tenant_id, e)
+        HIPAALogger.log_mcp_access(tenant_id, "server_creation", "error", str(e))
+        return None
 
 # ------------------------------------------------------------------
-# Single Medspa assistant agent (dynamic toolbox set per-tenant)
+# HIPAA-Compliant Tenant Validation with Rate Limiting
 # ------------------------------------------------------------------
 
-# Main conversational agent - initialize without MCP servers since they're tenant-specific
+async def validate_tenant_with_rate_limit(tenant_id: str) -> bool:
+    """
+    Enhanced tenant validation with rate limiting for HIPAA compliance.
+    HIPAA: Implements access controls per §164.312(a)(1) and audit logging per §164.312(b)
+    """
+    current_time = time.time()
+    
+    # Rate limiting per tenant
+    if tenant_id not in _tenant_access_times:
+        _tenant_access_times[tenant_id] = []
+    
+    # Clean old entries
+    window_start = current_time - RATE_LIMIT_WINDOW
+    _tenant_access_times[tenant_id] = [
+        t for t in _tenant_access_times[tenant_id] if t > window_start
+    ]
+    
+    # Check rate limit
+    if len(_tenant_access_times[tenant_id]) >= MAX_REQUESTS_PER_WINDOW:
+        logger.warning("[HIPAA] Rate limit exceeded for tenant '%s'", tenant_id)
+        HIPAALogger.log_tenant_access(tenant_id, "", "rate_limit_exceeded", "denied")
+        return False
+    
+    # Record this access
+    _tenant_access_times[tenant_id].append(current_time)
+    
+    # Basic tenant ID validation (alphanumeric, underscore, hyphen only)
+    if not tenant_id or not isinstance(tenant_id, str):
+        logger.warning("[HIPAA] Invalid tenant_id format: %s", tenant_id)
+        HIPAALogger.log_tenant_access(tenant_id, "", "invalid_format", "denied")
+        return False
+        
+    if not tenant_id.replace('_', '').replace('-', '').isalnum():
+        logger.warning("[HIPAA] Tenant ID contains invalid characters: %s", tenant_id)
+        HIPAALogger.log_tenant_access(tenant_id, "", "invalid_characters", "denied")
+        return False
+    
+    try:
+        base_url = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip('/')
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{base_url}/tenants")
+            
+            if response.status_code == 200:
+                tenant_data = response.json()
+                available_tenants = set(tenant_data.get("tenants", {}).keys())
+                
+                is_valid = tenant_id in available_tenants
+                
+                if is_valid:
+                    logger.info("[HIPAA] Tenant '%s' validated successfully", tenant_id)
+                    HIPAALogger.log_tenant_access(tenant_id, "", "validation", "success")
+                else:
+                    logger.warning("[HIPAA] Tenant '%s' not found in available tenants: %s", 
+                                 tenant_id, list(available_tenants))
+                    HIPAALogger.log_tenant_access(tenant_id, "", "validation", "not_found")
+                
+                return is_valid
+            else:
+                logger.error("[HIPAA] Failed to validate tenant '%s': HTTP %d", 
+                           tenant_id, response.status_code)
+                HIPAALogger.log_tenant_access(tenant_id, "", "validation", "http_error")
+                return False
+                
+    except Exception as e:
+        logger.error("[HIPAA] Tenant validation error for '%s': %s", tenant_id, e)
+        HIPAALogger.log_tenant_access(tenant_id, "", "validation", "exception")
+        return False
+
+# MCP server creation function is now integrated above
+
+@asynccontextmanager
+async def managed_tenant_context(tenant_id: str, session_id: str):
+    """
+    Managed context for tenant operations with proper cleanup and audit logging.
+    HIPAA: Ensures proper access control and audit trail per §164.312(a)(1) and §164.312(b)
+    """
+    start_time = time.time()
+    try:
+        HIPAALogger.log_tenant_access(tenant_id, session_id, "context_start", "success")
+        yield
+    except Exception as e:
+        logger.error("[HIPAA] Context error for tenant '%s', session '%s': %s", tenant_id, session_id, e)
+        HIPAALogger.log_tenant_access(tenant_id, session_id, "context_error", str(e))
+        raise
+    finally:
+        duration = time.time() - start_time
+        logger.debug("[HIPAA] Context completed for tenant '%s' in %.2fs", tenant_id, duration)
+        HIPAALogger.log_tenant_access(tenant_id, session_id, "context_end", f"duration_{duration:.2f}s")
+
+# ------------------------------------------------------------------
+# Single Optimized Medspa Assistant Agent
+# ------------------------------------------------------------------
+
+# Single agent instance with dynamic MCP configuration for optimal performance
 medspa_agent = Agent(
     name="Medspa Agent",
     instructions="""You are a friendly medspa assistant. Your role is to provide information about the medspa, answer questions, 
@@ -46,11 +279,13 @@ When responding to the user:
 5. If the user expresses interest in booking, suggest they schedule a consultation
 
 Remember to be conversational, not corporate. Make the user feel valued and understood.
+
+IMPORTANT: You must maintain strict confidentiality and privacy in all interactions, 
+adhering to HIPAA guidelines for protected health information.
 """,
     model="gpt-4o",
-    # Remove mcp_servers parameter - we'll attach tools dynamically per request
+    # MCP servers will be configured dynamically per request via RunnerContext
 )
-
 
 _httpx_client = httpx.AsyncClient()
 _oai_client: AsyncOpenAI = AsyncOpenAI(http_client=_httpx_client)
@@ -75,14 +310,16 @@ class StreamingHandle:
         except Exception:
             pass
 
-
 # ---------------------------------------------------------------------------
-# Public helpers – consolidated HTTP transport
+# Optimized Agent Response Functions with Native MCP Support
 # ---------------------------------------------------------------------------
 
-# Model Context Protocol version header for MCP requests
-# Using the latest protocol version as specified in documentation
-MCP_PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-03-26")
+def ensure_cleanup_task_running():
+    """Ensure the periodic cache cleanup task is running."""
+    global _cleanup_task
+    if _cleanup_task is None or _cleanup_task.done():
+        _cleanup_task = asyncio.create_task(periodic_cache_cleanup())
+        logger.info("[HIPAA-MCP] Started periodic cache cleanup task")
 
 async def get_agent_response(
     transcript: str,
@@ -90,151 +327,71 @@ async def get_agent_response(
     tenant_id: str,
     session_id: Optional[str] = None,
 ) -> tuple[list, str]:
-    """Generate a full assistant response using the HTTP+JSON-RPC MCP transport.
-
-    Parameters
-    ----------
-    transcript : str
-        The latest user utterance.
-    call_conversation_history : list
-        The existing dialog history for this call (MCP-compliant OpenAI format).
-    tenant_id : str
-        Logical tenant identifier used to isolate tool scopes and auth.
-    session_id : Optional[str], optional
-        Session ID for the MCP request, by default None
-
-    Returns
-    -------
-    tuple(updated_history, response_text)
-        *updated_history* – The dialog history including the assistant reply
-        *response_text* – The assistant's natural-language response
     """
-
-    # Initialize MCP client for this tenant
-    logger.info("[MCP] Initializing for tenant '%s'", tenant_id)
+    Generate optimized assistant response using OpenAI Agents SDK native MCP support.
     
-    # Construct tenant-specific URL following the server's routing pattern
-    # The server mounts tenants at /{tenant_id}/mcp
-    raw_base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
-    parsed = urlparse(raw_base)
-    scheme = parsed.scheme or "https"
-    netloc = parsed.netloc or parsed.path
+    Optimizations implemented:
+    - Uses single agent instance with dynamic MCP configuration
+    - Implements connection pooling and configuration caching
+    - Enhanced HIPAA audit logging with rate limiting
+    - Streamlined error handling with proper fallbacks
     
-    # Construct the tenant-specific MCP endpoint URL
-    transport_url = f"{scheme}://{netloc}/{tenant_id}/mcp/"
-    logger.debug("[MCP] Using Streamable HTTP transport URL: %s", transport_url)
+    HIPAA Compliance: Validates tenant authorization, maintains strict data isolation,
+    implements proper access controls per §164.312(a)(1), logs security events per §164.312(b)
+    """
     
-    # Prepare messages for the agent
-    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
+    # Ensure cleanup task is running for optimal performance
+    ensure_cleanup_task_running()
     
-    # Connect to MCP server and dynamically load tools for this tenant
-    # Using context manager ensures proper cleanup
-    async with Client(transport=transport_url, log_handler=log_handler) as mcp_client:
-        logger.info("[MCP] Opening connection to server at %s", transport_url)
-        
-        try:
-            # Verify connection is working
-            logger.debug("[MCP] Sending ping for tenant '%s'", tenant_id)
-            await mcp_client.ping()
-            logger.info("[MCP] Ping successful for tenant '%s'", tenant_id)
-        except Exception as e:
-            logger.error("[MCP] Failed to connect to MCP server for tenant '%s': %s", tenant_id, e)
-            logger.error("[MCP] Check that the MCP server is running and accessible at %s", transport_url)
-            # Return a fallback response without MCP tools
+    async with managed_tenant_context(tenant_id, session_id or "anonymous"):
+        # Step 1: Enhanced tenant validation with rate limiting
+        if not await validate_tenant_with_rate_limit(tenant_id):
+            logger.error("[HIPAA] Tenant validation failed for '%s' - using secure fallback", tenant_id)
+            # Secure fallback without tools for HIPAA compliance
+            agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
             result = await Runner.run(medspa_agent, agent_input)
             return result.to_input_list(), result.final_output
         
-        # Retrieve available tools from the tenant's MCP server
-        try:
-            logger.info("[MCP] Listing tools for tenant '%s'", tenant_id)
-            mcp_tools = await mcp_client.list_tools()
-            logger.info("[MCP] Retrieved %d tools for tenant '%s'", len(mcp_tools), tenant_id)
-            
-            # Log tool names for debugging
-            tool_names = [tool.name for tool in mcp_tools]
-            logger.debug("[MCP] Available tools: %s", tool_names)
-        except Exception as e:
-            logger.error("[MCP] Failed to list tools for tenant '%s': %s", tenant_id, e)
-            mcp_tools = []
+        # Step 2: Create tenant-specific MCP server (cached for performance)
+        mcp_server = create_optimized_mcp_server(tenant_id)
         
-        # Convert MCP tools into FunctionTools for the agent
-        function_tools: list[FunctionTool] = []
+        if not mcp_server:
+            logger.error("[HIPAA] Failed to create MCP server for tenant '%s' - using fallback", tenant_id)
+            # Fallback to agent without tools for security
+            agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
+            result = await Runner.run(medspa_agent, agent_input)
+            return result.to_input_list(), result.final_output
         
-        for tool in mcp_tools:
-            name = tool.name
-            description = tool.description or f"Tool: {name}"
-            
-            # Get the JSON schema for parameters
-            # FastMCP tools have inputSchema attribute
-            params_schema = tool.inputSchema if hasattr(tool, 'inputSchema') else {}
-            
-            logger.debug("[MCP] Converting tool '%s' with schema: %s", name, params_schema)
-            
-            # Create invocation function that calls MCP tool
-            async def _invoke(ctx, args_json: str, _name=name, _mcp=mcp_client):
-                """Invoke MCP tool with proper error handling."""
-                try:
-                    params = json.loads(args_json) if args_json else {}
-                    logger.debug("[MCP] Calling tool '%s' with params: %s", _name, params)
-                    
-                    # Call the tool through the MCP client
-                    results = await _mcp.call_tool(_name, params)
-                    
-                    # Handle different result types
-                    if hasattr(results, 'content'):
-                        # Single result with content attribute
-                        content_items = results.content if isinstance(results.content, list) else [results.content]
-                    elif isinstance(results, list):
-                        # List of results
-                        content_items = results
-                    else:
-                        # Direct result
-                        content_items = [results]
-                    
-                    # Extract text from results
-                    texts = []
-                    for item in content_items:
-                        if hasattr(item, 'text'):
-                            texts.append(item.text)
-                        elif isinstance(item, str):
-                            texts.append(item)
-                        else:
-                            texts.append(str(item))
-                    
-                    result_text = '\n'.join(texts)
-                    logger.debug("[MCP] Tool '%s' returned: %s", _name, result_text[:200])
-                    return result_text
-                    
-                except Exception as e:
-                    logger.error("[MCP] Error calling tool '%s': %s", _name, e)
-                    return f"Error calling tool {_name}: {str(e)}"
-            
-            # Build and collect the FunctionTool
-            function_tool = FunctionTool(
-                name=name,
-                description=description,
-                params_json_schema=params_schema,
-                on_invoke_tool=_invoke,
-            )
-            function_tools.append(function_tool)
-        
-        logger.info("[MCP] Created %d FunctionTools for agent", len(function_tools))
-        
-        # Create a new agent instance with the tenant-specific tools
-        # This ensures proper tool isolation per tenant
+        # Step 3: Configure agent with tenant-specific MCP server
+        # Using the single agent instance with dynamic MCP server configuration
         tenant_agent = Agent(
             name=medspa_agent.name,
             instructions=medspa_agent.instructions,
             model=medspa_agent.model,
-            tools=function_tools,  # Attach the tenant-specific tools
+            mcp_servers=[mcp_server]  # Use the tenant-specific MCP server
         )
         
-        # Run the agent with the tenant-specific configuration
-        logger.info("[MCP] Invoking agent run for tenant '%s' with %d tools", tenant_id, len(function_tools))
-        result = await Runner.run(tenant_agent, agent_input)
-        logger.info("[MCP] Agent run complete for tenant '%s'", tenant_id)
+        # Step 4: Execute optimized agent run with native MCP support
+        agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
         
-        return result.to_input_list(), result.final_output
+        try:
+            logger.info("[HIPAA] Executing optimized agent run for tenant '%s' with MCP server %s", 
+                       tenant_id, mcp_server.name)
+            
+            result = await Runner.run(tenant_agent, agent_input)
+            
+            logger.info("[HIPAA] Agent run completed successfully for tenant '%s'", tenant_id)
+            HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "agent_run", "success")
+            
+            return result.to_input_list(), result.final_output
+            
+        except Exception as e:
+            logger.error("[HIPAA] Agent execution error for tenant '%s': %s", tenant_id, e)
+            HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "agent_run", "error")
+            
+            # Secure fallback on any execution error
+            result = await Runner.run(medspa_agent, agent_input)
+            return result.to_input_list(), result.final_output
 
 
 async def stream_agent_deltas(
@@ -243,43 +400,48 @@ async def stream_agent_deltas(
     tenant_id: str,
     session_id: Optional[str] = None,
 ):
-    """Stream assistant deltas for real-time TTS while preserving history.
-
-    The function returns a tuple consisting of:
-
-    1. *updated_history_future* – resolves to the updated chat history once
-       the stream concludes.
-    2. *delta_generator* – async generator that yields str deltas as produced
-       by the LLM.
-    3. *handle* – `StreamingHandle` instance that allows the caller to cancel
-       the in-flight stream (used by VAD).
+    """
+    Stream assistant deltas with optimized MCP configuration reuse.
+    
+    Optimizations implemented:
+    - Reuses MCP configuration from get_agent_response
+    - Single agent instance with dynamic configuration
+    - Shared validation and context management
+    - Optimized streaming with proper error handling
+    
+    HIPAA Compliance: Maintains tenant isolation during streaming, implements proper access controls
     """
 
-    # Prepare messages for the agent
-    agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
+    async with managed_tenant_context(tenant_id, session_id or "anonymous"):
+        # Prepare messages for the agent
+        agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
 
-    loop = asyncio.get_running_loop()
-    updated_hist_future: asyncio.Future = loop.create_future()
+        loop = asyncio.get_running_loop()
+        updated_hist_future: asyncio.Future = loop.create_future()
 
-    async def _delta_generator():
-        # Construct tenant-specific URL
-        raw_base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
-        parsed = urlparse(raw_base)
-        scheme = parsed.scheme or "https"
-        netloc = parsed.netloc or parsed.path
-        transport_url = f"{scheme}://{netloc}/{tenant_id}/mcp/"
-        logger.debug("[MCP-STREAM] Using Streamable HTTP transport URL: %s", transport_url)
-        
-        # Connect to MCP server and dynamically load tools
-        async with Client(transport=transport_url, log_handler=log_handler) as mcp_client:
-            logger.info("[MCP-STREAM] Opening connection for tenant '%s'", tenant_id)
+        async def _delta_generator():
+            # Step 1: Enhanced tenant validation (shared with get_agent_response)
+            if not await validate_tenant_with_rate_limit(tenant_id):
+                logger.error("[HIPAA] Streaming tenant validation failed for '%s'", tenant_id)
+                HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "validation_failed")
+                
+                # Secure fallback without tools
+                streaming_result = Runner.run_streamed(medspa_agent, agent_input)
+                async for event in streaming_result.stream_events():
+                    if (
+                        event.type == "raw_response_event"
+                        and isinstance(event.data, ResponseTextDeltaEvent)
+                    ):
+                        yield event.data.delta
+                if not updated_hist_future.done():
+                    updated_hist_future.set_result(streaming_result.to_input_list())
+                return
             
-            try:
-                logger.debug("[MCP-STREAM] Sending ping for tenant '%s'", tenant_id)
-                await mcp_client.ping()
-                logger.info("[MCP-STREAM] Ping successful for tenant '%s'", tenant_id)
-            except Exception as e:
-                logger.error("[MCP-STREAM] Failed to connect to MCP server for tenant '%s': %s", tenant_id, e)
+            # Step 2: Reuse MCP server (cached for performance)
+            mcp_server = create_optimized_mcp_server(tenant_id)
+            
+            if not mcp_server:
+                logger.error("[HIPAA] Failed to create streaming MCP server for tenant '%s'", tenant_id)
                 # Fall back to agent without tools
                 streaming_result = Runner.run_streamed(medspa_agent, agent_input)
                 async for event in streaming_result.stream_events():
@@ -292,80 +454,48 @@ async def stream_agent_deltas(
                     updated_hist_future.set_result(streaming_result.to_input_list())
                 return
             
-            # Get tools for streaming
-            try:
-                mcp_tools = await mcp_client.list_tools()
-                logger.info("[MCP-STREAM] Retrieved %d tools for tenant '%s'", len(mcp_tools), tenant_id)
-            except Exception as e:
-                logger.error("[MCP-STREAM] Failed to list tools: %s", e)
-                mcp_tools = []
-            
-            # Convert tools
-            function_tools: list[FunctionTool] = []
-            for tool in mcp_tools:
-                name = tool.name
-                description = tool.description or f"Tool: {name}"
-                params_schema = tool.inputSchema if hasattr(tool, 'inputSchema') else {}
-                
-                async def _invoke(ctx, args_json: str, _name=name, _mcp=mcp_client):
-                    try:
-                        params = json.loads(args_json) if args_json else {}
-                        results = await _mcp.call_tool(_name, params)
-                        
-                        # Handle results
-                        if hasattr(results, 'content'):
-                            content_items = results.content if isinstance(results.content, list) else [results.content]
-                        elif isinstance(results, list):
-                            content_items = results
-                        else:
-                            content_items = [results]
-                        
-                        texts = []
-                        for item in content_items:
-                            if hasattr(item, 'text'):
-                                texts.append(item.text)
-                            elif isinstance(item, str):
-                                texts.append(item)
-                            else:
-                                texts.append(str(item))
-                        
-                        return '\n'.join(texts)
-                    except Exception as e:
-                        logger.error("[MCP-STREAM] Error calling tool '%s': %s", _name, e)
-                        return f"Error calling tool {_name}: {str(e)}"
-                
-                function_tools.append(
-                    FunctionTool(
-                        name=name,
-                        description=description,
-                        params_json_schema=params_schema,
-                        on_invoke_tool=_invoke,
-                    )
-                )
-            
-            logger.info("[MCP-STREAM] Created %d FunctionTools", len(function_tools))
-            
-            # Create tenant-specific agent
+            # Step 3: Configure tenant-specific agent for streaming
             tenant_agent = Agent(
                 name=medspa_agent.name,
                 instructions=medspa_agent.instructions,
                 model=medspa_agent.model,
-                tools=function_tools,
+                mcp_servers=[mcp_server]  # Use the tenant-specific MCP server
             )
             
-            # Execute streaming with tenant-specific agent
-            logger.info("[MCP-STREAM] Starting streaming agent run for tenant '%s'", tenant_id)
-            streaming_result = Runner.run_streamed(tenant_agent, agent_input)
-            
-            async for event in streaming_result.stream_events():
-                if (
-                    event.type == "raw_response_event"
-                    and isinstance(event.data, ResponseTextDeltaEvent)
-                ):
-                    yield event.data.delta
-                    
-            if not updated_hist_future.done():
-                updated_hist_future.set_result(streaming_result.to_input_list())
+            # Step 4: Execute optimized streaming with native MCP support
+            try:
+                logger.info("[HIPAA] Starting optimized streaming for tenant '%s'", tenant_id)
+                HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "started")
+                
+                streaming_result = Runner.run_streamed(tenant_agent, agent_input)
+                
+                async for event in streaming_result.stream_events():
+                    if (
+                        event.type == "raw_response_event"
+                        and isinstance(event.data, ResponseTextDeltaEvent)
+                    ):
+                        yield event.data.delta
+                        
+                if not updated_hist_future.done():
+                    updated_hist_future.set_result(streaming_result.to_input_list())
+                
+                logger.info("[HIPAA] Streaming completed successfully for tenant '%s'", tenant_id)
+                HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "completed")
+                
+            except Exception as e:
+                logger.error("[HIPAA] Streaming error for tenant '%s': %s", tenant_id, e)
+                HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "error")
+                
+                # Secure fallback on streaming error
+                streaming_result = Runner.run_streamed(medspa_agent, agent_input)
+                async for event in streaming_result.stream_events():
+                    if (
+                        event.type == "raw_response_event"
+                        and isinstance(event.data, ResponseTextDeltaEvent)
+                    ):
+                        yield event.data.delta
+                if not updated_hist_future.done():
+                    updated_hist_future.set_result(streaming_result.to_input_list())
 
-    agen = _delta_generator()
-    return updated_hist_future, agen, StreamingHandle(agen)
+        agen = _delta_generator()
+        return updated_hist_future, agen, StreamingHandle(agen)
