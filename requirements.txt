@@ -27,7 +27,7 @@ httpcore==1.0.7
 pydantic==2.10.3
 pydantic-core==2.27.1
 python-dotenv==1.0.1
-aiofiles==23.2.0
+aiofiles==23.2.1
 
 # Type compatibility (exact versions to avoid conflicts)
 typing_extensions==4.12.2
