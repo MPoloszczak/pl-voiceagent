@@ -1,29 +1,29 @@
-# Core OpenAI and MCP dependencies
-openai-agents>=0.0.15
+# Core OpenAI and MCP dependencies (pinned for stability)
+openai-agents==0.0.16
 openai-agents-mcp>=0.0.5
 
-# Audio processing
+# Audio processing (stable versions)
 deepgram-sdk==3.10.1
 elevenlabs==1.5.0
 pyaudio>=0.2.14
 webrtcvad==2.0.10
 
-# Web framework (FastAPI with minimal dependencies)
+# Web framework (FastAPI with optimized dependencies)
 fastapi==0.112.0
 uvicorn==0.34.0
 websockets>=12.0
 python-multipart==0.0.12
 
-# HTTP client (consolidated to httpx only)
-httpx[http2]>=0.28.1,<0.29
+# HTTP client (single client to avoid conflicts)
+httpx[http2]==0.28.1
 
-# Data handling and validation
-pydantic>=2.0.0
-pydantic-core>=2.18.2
+# Data handling and validation (compatible versions)
+pydantic>=2.0.0,<3.0.0
+pydantic-core>=2.18.2,<3.0.0
 python-dotenv>=1.1.0,<2.0
 aiofiles==23.*
 
-# Type and compatibility
+# Type compatibility (minimal to avoid conflicts)
 typing_extensions>=4.0.0,<5.0.0
 dataclasses-json==0.*
 
@@ -31,7 +31,7 @@ dataclasses-json==0.*
 PyJWT>=2.0.0,<3.0.0
 certifi>=2023.7.22
 
-# Database and caching
+# Database and caching (pinned for stability)
 redis==5.0.4
 asyncpg==0.29.*
 sqlalchemy[asyncio]==2.0.*
@@ -42,3 +42,8 @@ aws-xray-sdk>=2.13
 
 # MCP server framework
 fastmcp==2.3.3
+
+# Type stubs (pinned to avoid urllib3 conflicts)
+# Based on GitHub issue #10825 - types-requests>=2.31.0.7 conflicts with urllib3<2
+# Using older version to maintain compatibility
+types-requests==2.31.0.6
