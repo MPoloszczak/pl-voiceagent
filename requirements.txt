@@ -1,49 +1,55 @@
-# Core OpenAI and MCP dependencies (pinned for stability)
-openai-agents==0.0.16
-openai-agents-mcp>=0.0.5
+# Production-ready requirements with exact versions to eliminate conflicts
+# Optimized for fast installation and HIPAA compliance
 
-# Audio processing (stable versions)
+# Core OpenAI and MCP dependencies
+openai-agents==0.0.16
+openai-agents-mcp==0.0.5
+
+# Audio processing (exact versions)
 deepgram-sdk==3.10.1
 elevenlabs==1.5.0
-pyaudio>=0.2.14
+pyaudio==0.2.14
 webrtcvad==2.0.10
 
-# Web framework (FastAPI with optimized dependencies)
+# Web framework (FastAPI stack - exact versions)
 fastapi==0.112.0
 uvicorn==0.34.0
-websockets>=12.0
+websockets==12.0
 python-multipart==0.0.12
 
-# HTTP client (single client to avoid conflicts)
-httpx[http2]==0.28.1
+# HTTP client (pinned version to avoid conflicts)
+httpx==0.28.1
+# Required by httpx[http2]
+h2==4.1.0
+httpcore==1.0.7
 
-# Data handling and validation (compatible versions)
-pydantic>=2.0.0,<3.0.0
-pydantic-core>=2.18.2,<3.0.0
-python-dotenv>=1.1.0,<2.0
-aiofiles==23.*
+# Data handling and validation (exact versions)
+pydantic==2.10.3
+pydantic-core==2.27.1
+python-dotenv==1.0.1
+aiofiles==23.2.0
 
-# Type compatibility (minimal to avoid conflicts)
-typing_extensions>=4.0.0,<5.0.0
-dataclasses-json==0.*
+# Type compatibility (exact versions to avoid conflicts)
+typing_extensions==4.12.2
 
 # Security and authentication
-PyJWT>=2.0.0,<3.0.0
-certifi>=2023.7.22
+PyJWT==2.9.0
+certifi==2024.8.30
 
-# Database and caching (pinned for stability)
+# Database and caching (exact versions)
 redis==5.0.4
-asyncpg==0.29.*
-sqlalchemy[asyncio]==2.0.*
+asyncpg==0.29.0
+sqlalchemy[asyncio]==2.0.36
 
-# AWS integration
-boto3>=1.34
-aws-xray-sdk>=2.13
+# AWS integration (exact versions)
+boto3==1.35.78
+aws-xray-sdk==2.14.0
 
 # MCP server framework
 fastmcp==2.3.3
 
-# Type stubs (pinned to avoid urllib3 conflicts)
-# Based on GitHub issue #10825 - types-requests>=2.31.0.7 conflicts with urllib3<2
-# Using older version to maintain compatibility
-types-requests==2.31.0.6
+# Core dependencies (pinned for stability)
+idna==3.10
+sniffio==1.3.1
+anyio==4.6.2
+h11==0.14.0
