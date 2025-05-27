@@ -49,7 +49,7 @@ async def periodic_cache_cleanup():
     while True:
         try:
             await asyncio.sleep(1800)  # Clean up every 30 minutes
-            cleaned = cleanup_expired_cache_entries()
+            cleaned = await cleanup_expired_cache_entries()
             if cleaned > 0:
                 logger.info(f"[HIPAA-MCP] Periodic cleanup removed {cleaned} expired cache entries")
         except Exception as e:
@@ -58,28 +58,50 @@ async def periodic_cache_cleanup():
 # Cleanup task reference
 _cleanup_task = None
 
-def cleanup_expired_cache_entries():
-    """Clean up expired cache entries to prevent memory leaks."""
+async def cleanup_expired_cache_entries():
+    """Clean up expired cache entries and disconnected servers to prevent memory leaks."""
     current_time = time.time()
     expired_tenants = []
+    disconnected_tenants = []
     
     for tenant_id, creation_time in _cache_creation_times.items():
         age = current_time - creation_time
         if age >= CACHE_TTL_SECONDS:
             expired_tenants.append(tenant_id)
+        elif tenant_id in _mcp_server_cache:
+            # Check if server is still connected
+            server = _mcp_server_cache[tenant_id]
+            if hasattr(server, 'session') and not server.session:
+                disconnected_tenants.append(tenant_id)
     
+    # Clean up expired entries
     for tenant_id in expired_tenants:
+        if tenant_id in _mcp_server_cache:
+            server = _mcp_server_cache.pop(tenant_id, None)
+            _cache_creation_times.pop(tenant_id, None)
+            # Cleanup server connection if it exists
+            if server and hasattr(server, 'cleanup'):
+                try:
+                    await server.cleanup()
+                except Exception as e:
+                    logger.debug("[HIPAA-MCP] Error cleaning up server for tenant '%s': %s", tenant_id, e)
+            logger.debug("[HIPAA-MCP] Cleaned up expired cache entry for tenant '%s'", tenant_id)
+    
+    # Clean up disconnected entries
+    for tenant_id in disconnected_tenants:
         if tenant_id in _mcp_server_cache:
             _mcp_server_cache.pop(tenant_id, None)
             _cache_creation_times.pop(tenant_id, None)
-            logger.debug("[HIPAA-MCP] Cleaned up expired cache entry for tenant '%s'", tenant_id)
+            logger.debug("[HIPAA-MCP] Cleaned up disconnected cache entry for tenant '%s'", tenant_id)
     
-    if expired_tenants:
-        logger.info("[HIPAA-MCP] Cleaned up %d expired cache entries", len(expired_tenants))
+    total_cleaned = len(expired_tenants) + len(disconnected_tenants)
+    if total_cleaned > 0:
+        logger.info("[HIPAA-MCP] Cleaned up %d cache entries (%d expired, %d disconnected)", 
+                   total_cleaned, len(expired_tenants), len(disconnected_tenants))
     
-    return len(expired_tenants)
+    return total_cleaned
 
-def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
+async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
     """
     Create or retrieve cached MCP server for tenant with optimizations.
     
@@ -88,6 +110,7 @@ def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
     - Tool list caching enabled  
     - Connection timeout optimized for real-time voice
     - Streamable HTTP transport for low latency
+    - Proper connection lifecycle management
     
     HIPAA Compliance: Tenant isolation per §164.312(a)(1), audit logging per §164.312(b)
     """
@@ -97,10 +120,17 @@ def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
     if tenant_id in _mcp_server_cache:
         cache_age = current_time - _cache_creation_times.get(tenant_id, 0)
         if cache_age < CACHE_TTL_SECONDS:
-            logger.debug("[HIPAA-MCP] Using cached server for tenant '%s' (age: %.1fs)", 
-                        tenant_id, cache_age)
-            HIPAALogger.log_mcp_access(tenant_id, "cache_hit", "success", f"age_{cache_age:.1f}s")
-            return _mcp_server_cache[tenant_id]
+            cached_server = _mcp_server_cache[tenant_id]
+            # Verify server is still connected
+            if hasattr(cached_server, 'session') and cached_server.session:
+                logger.debug("[HIPAA-MCP] Using cached connected server for tenant '%s' (age: %.1fs)", 
+                            tenant_id, cache_age)
+                HIPAALogger.log_mcp_access(tenant_id, "cache_hit", "success", f"age_{cache_age:.1f}s")
+                return cached_server
+            else:
+                logger.debug("[HIPAA-MCP] Cached server for tenant '%s' not connected, recreating", tenant_id)
+                _mcp_server_cache.pop(tenant_id, None)
+                _cache_creation_times.pop(tenant_id, None)
         else:
             # Cache expired, remove old entry
             logger.debug("[HIPAA-MCP] Cache expired for tenant '%s', creating new server", tenant_id)
@@ -108,14 +138,21 @@ def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
             _cache_creation_times.pop(tenant_id, None)
     
     try:
-        # Construct tenant-specific MCP URL
+        # Construct tenant-specific MCP URL (no trailing slash per server spec)
         raw_base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
         parsed = urlparse(raw_base)
         scheme = parsed.scheme or "https"
         netloc = parsed.netloc or parsed.path
         
+        # Ensure no trailing slash and proper path construction
         base_url = f"{scheme}://{netloc}".rstrip('/')
         transport_url = f"{base_url}/{tenant_id}/mcp"
+        
+        # Validate URL format for HIPAA compliance
+        if not transport_url.startswith(('https://', 'http://localhost')):
+            logger.error("[HIPAA-MCP] Invalid URL scheme for tenant '%s': %s", tenant_id, transport_url)
+            HIPAALogger.log_mcp_access(tenant_id, "url_validation", "invalid_scheme", transport_url)
+            return None
         
         logger.info("[HIPAA-MCP] Creating optimized MCP server for tenant '%s' at %s", 
                    tenant_id, transport_url)
@@ -142,12 +179,33 @@ def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
             client_session_timeout_seconds=15.0  # Real-time voice optimization
         )
         
-        # Cache the server and record creation time
+        # Connect the server before caching (critical for streaming)
+        logger.info("[HIPAA-MCP] Connecting MCP server for tenant '%s'", tenant_id)
+        try:
+            await asyncio.wait_for(mcp_server.connect(), timeout=30.0)
+            
+            # Verify connection by attempting to list tools
+            tools = await asyncio.wait_for(mcp_server.list_tools(), timeout=10.0)
+            logger.info("[HIPAA-MCP] MCP server connected successfully for tenant '%s', found %d tools", 
+                       tenant_id, len(tools))
+            
+        except asyncio.TimeoutError:
+            logger.error("[HIPAA-MCP] Connection timeout for tenant '%s' after 30s", tenant_id)
+            HIPAALogger.log_mcp_access(tenant_id, "connection", "timeout", "30s")
+            await mcp_server.cleanup()
+            return None
+        except Exception as connect_error:
+            logger.error("[HIPAA-MCP] Connection failed for tenant '%s': %s", tenant_id, connect_error)
+            HIPAALogger.log_mcp_access(tenant_id, "connection", "failed", str(connect_error))
+            await mcp_server.cleanup()
+            return None
+        
+        # Cache the connected server and record creation time
         _mcp_server_cache[tenant_id] = mcp_server
         _cache_creation_times[tenant_id] = current_time
         
-        logger.info("[HIPAA-MCP] Created and cached MCP server for tenant '%s'", tenant_id)
-        HIPAALogger.log_mcp_access(tenant_id, "server_created", "success", f"url_{transport_url}")
+        logger.info("[HIPAA-MCP] Created, connected and cached MCP server for tenant '%s'", tenant_id)
+        HIPAALogger.log_mcp_access(tenant_id, "server_created_connected", "success", f"url_{transport_url}")
         
         return mcp_server
         
@@ -160,6 +218,33 @@ def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
         logger.error("[HIPAA-MCP] Failed to create MCP server for tenant '%s': %s", tenant_id, e)
         HIPAALogger.log_mcp_access(tenant_id, "server_creation", "error", str(e))
         return None
+
+# ------------------------------------------------------------------
+# MCP Connection Health Check for HIPAA Monitoring
+# ------------------------------------------------------------------
+
+async def check_mcp_server_health(tenant_id: str) -> bool:
+    """
+    Check MCP server health for HIPAA monitoring and compliance.
+    Returns True if server is healthy, False otherwise.
+    """
+    try:
+        if tenant_id not in _mcp_server_cache:
+            return False
+            
+        server = _mcp_server_cache[tenant_id]
+        if not hasattr(server, 'session') or not server.session:
+            return False
+            
+        # Quick health check by listing tools
+        tools = await asyncio.wait_for(server.list_tools(), timeout=5.0)
+        HIPAALogger.log_mcp_access(tenant_id, "health_check", "success", f"tools_{len(tools)}")
+        return True
+        
+    except Exception as e:
+        logger.warning("[HIPAA-MCP] Health check failed for tenant '%s': %s", tenant_id, e)
+        HIPAALogger.log_mcp_access(tenant_id, "health_check", "failed", str(e))
+        return False
 
 # ------------------------------------------------------------------
 # HIPAA-Compliant Tenant Validation with Rate Limiting
@@ -353,7 +438,7 @@ async def get_agent_response(
             return result.to_input_list(), result.final_output
         
         # Step 2: Create tenant-specific MCP server (cached for performance)
-        mcp_server = create_optimized_mcp_server(tenant_id)
+        mcp_server = await create_optimized_mcp_server(tenant_id)
         
         if not mcp_server:
             logger.error("[HIPAA] Failed to create MCP server for tenant '%s' - using fallback", tenant_id)
@@ -363,6 +448,14 @@ async def get_agent_response(
             return result.to_input_list(), result.final_output
         
         # Step 3: Configure agent with tenant-specific MCP server
+        # Verify server health before proceeding
+        is_healthy = await check_mcp_server_health(tenant_id)
+        if not is_healthy:
+            logger.warning("[HIPAA] MCP server health check failed for tenant '%s', using fallback", tenant_id)
+            agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
+            result = await Runner.run(medspa_agent, agent_input)
+            return result.to_input_list(), result.final_output
+        
         # Using the single agent instance with dynamic MCP server configuration
         tenant_agent = Agent(
             name=medspa_agent.name,
@@ -378,12 +471,22 @@ async def get_agent_response(
             logger.info("[HIPAA] Executing optimized agent run for tenant '%s' with MCP server %s", 
                        tenant_id, mcp_server.name)
             
-            result = await Runner.run(tenant_agent, agent_input)
+            # Execute with proper error handling for tracing
+            try:
+                result = await Runner.run(tenant_agent, agent_input)
+                
+                logger.info("[HIPAA] Agent run completed successfully for tenant '%s'", tenant_id)
+                HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "agent_run", "success")
+                
+                # Ensure result is properly formatted for tracing
+                return result.to_input_list(), result.final_output
             
-            logger.info("[HIPAA] Agent run completed successfully for tenant '%s'", tenant_id)
-            HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "agent_run", "success")
-            
-            return result.to_input_list(), result.final_output
+            except Exception as runner_error:
+                logger.error("[HIPAA] Agent runner error for tenant '%s': %s", tenant_id, runner_error)
+                HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "agent_run", "runner_error")
+                # Fallback to basic agent without tools
+                result = await Runner.run(medspa_agent, agent_input)
+                return result.to_input_list(), result.final_output
             
         except Exception as e:
             logger.error("[HIPAA] Agent execution error for tenant '%s': %s", tenant_id, e)
@@ -438,7 +541,7 @@ async def stream_agent_deltas(
                 return
             
             # Step 2: Reuse MCP server (cached for performance)
-            mcp_server = create_optimized_mcp_server(tenant_id)
+            mcp_server = await create_optimized_mcp_server(tenant_id)
             
             if not mcp_server:
                 logger.error("[HIPAA] Failed to create streaming MCP server for tenant '%s'", tenant_id)
@@ -455,6 +558,21 @@ async def stream_agent_deltas(
                 return
             
             # Step 3: Configure tenant-specific agent for streaming
+            # Verify server health before proceeding
+            is_healthy = await check_mcp_server_health(tenant_id)
+            if not is_healthy:
+                logger.warning("[HIPAA] MCP server health check failed for streaming tenant '%s', using fallback", tenant_id)
+                streaming_result = Runner.run_streamed(medspa_agent, agent_input)
+                async for event in streaming_result.stream_events():
+                    if (
+                        event.type == "raw_response_event"
+                        and isinstance(event.data, ResponseTextDeltaEvent)
+                    ):
+                        yield event.data.delta
+                if not updated_hist_future.done():
+                    updated_hist_future.set_result(streaming_result.to_input_list())
+                return
+            
             tenant_agent = Agent(
                 name=medspa_agent.name,
                 instructions=medspa_agent.instructions,
@@ -469,33 +587,47 @@ async def stream_agent_deltas(
                 
                 streaming_result = Runner.run_streamed(tenant_agent, agent_input)
                 
-                async for event in streaming_result.stream_events():
-                    if (
-                        event.type == "raw_response_event"
-                        and isinstance(event.data, ResponseTextDeltaEvent)
-                    ):
-                        yield event.data.delta
-                        
-                if not updated_hist_future.done():
-                    updated_hist_future.set_result(streaming_result.to_input_list())
+                # Stream events with proper error handling
+                try:
+                    async for event in streaming_result.stream_events():
+                        if (
+                            event.type == "raw_response_event"
+                            and isinstance(event.data, ResponseTextDeltaEvent)
+                        ):
+                            yield event.data.delta
+                            
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(streaming_result.to_input_list())
+                    
+                    logger.info("[HIPAA] Streaming completed successfully for tenant '%s'", tenant_id)
+                    HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "completed")
                 
-                logger.info("[HIPAA] Streaming completed successfully for tenant '%s'", tenant_id)
-                HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "completed")
+                except Exception as stream_error:
+                    logger.error("[HIPAA] Streaming event error for tenant '%s': %s", tenant_id, stream_error)
+                    HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "stream_error")
+                    # Try to complete with basic result
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(agent_input + [{"role": "assistant", "content": "Error occurred during streaming"}])
                 
             except Exception as e:
-                logger.error("[HIPAA] Streaming error for tenant '%s': %s", tenant_id, e)
-                HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "error")
+                logger.error("[HIPAA] Streaming setup error for tenant '%s': %s", tenant_id, e)
+                HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "setup_error")
                 
                 # Secure fallback on streaming error
-                streaming_result = Runner.run_streamed(medspa_agent, agent_input)
-                async for event in streaming_result.stream_events():
-                    if (
-                        event.type == "raw_response_event"
-                        and isinstance(event.data, ResponseTextDeltaEvent)
-                    ):
-                        yield event.data.delta
-                if not updated_hist_future.done():
-                    updated_hist_future.set_result(streaming_result.to_input_list())
+                try:
+                    streaming_result = Runner.run_streamed(medspa_agent, agent_input)
+                    async for event in streaming_result.stream_events():
+                        if (
+                            event.type == "raw_response_event"
+                            and isinstance(event.data, ResponseTextDeltaEvent)
+                        ):
+                            yield event.data.delta
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(streaming_result.to_input_list())
+                except Exception as fallback_error:
+                    logger.error("[HIPAA] Fallback streaming error for tenant '%s': %s", tenant_id, fallback_error)
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(agent_input + [{"role": "assistant", "content": "Service temporarily unavailable"}])
 
         agen = _delta_generator()
         return updated_hist_future, agen, StreamingHandle(agen)
