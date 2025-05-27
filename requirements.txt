@@ -1,55 +1,59 @@
-# Production-ready requirements with exact versions to eliminate conflicts
-# Optimized for fast installation and HIPAA compliance
+# HIPAA-Compliant Voice AI Requirements
+# Optimized for fast installation and production stability
+# Using dynamic version ranges to eliminate dependency conflicts
 
-# Core OpenAI and MCP dependencies
-openai-agents==0.0.16
-openai-agents-mcp==0.0.5
+# === Core OpenAI and MCP Dependencies ===
+# Latest stable versions with compatible ranges
+openai-agents>=0.0.16,<0.1.0
+openai-agents-mcp>=0.0.5,<0.1.0
 
-# Audio processing (exact versions)
-deepgram-sdk==3.10.1
-elevenlabs==1.5.0
-pyaudio==0.2.14
-webrtcvad==2.0.10
+# === Audio Processing (Stable Versions) ===
+deepgram-sdk>=3.10.1,<4.0.0
+elevenlabs>=1.5.0,<2.0.0  
+pyaudio>=0.2.14,<0.3.0
+webrtcvad>=2.0.10,<3.0.0
 
-# Web framework (FastAPI stack - exact versions)
-fastapi==0.112.0
-uvicorn==0.34.0
-websockets==12.0
-python-multipart==0.0.12
+# === Web Framework (FastAPI Stack) ===
+fastapi>=0.112.0,<0.120.0
+uvicorn>=0.34.0,<0.40.0
+websockets>=12.0,<13.0
+python-multipart>=0.0.12,<0.1.0
 
-# HTTP client (pinned version to avoid conflicts)
-httpx==0.28.1
-# Required by httpx[http2]
-h2==4.1.0
-httpcore==1.0.7
+# === HTTP Client (Compatible Versions) ===
+# httpx with compatible dependencies based on research
+httpx>=0.28.1,<0.29.0
+httpcore>=1.0.7,<2.0.0
+h2>=4.1.0,<5.0.0
+anyio>=4.6.2,<5.0.0
+h11>=0.14.0,<0.15.0
 
-# Data handling and validation (exact versions)
-pydantic==2.10.3
-pydantic-core==2.27.1
-python-dotenv==1.0.1
-aiofiles==23.2.1
+# === Data Handling and Validation ===
+pydantic>=2.10.0,<3.0.0
+pydantic-core>=2.27.0,<3.0.0
+python-dotenv>=1.1.0,<2.0.0  # Fixed: Updated to meet fastmcp requirement
+aiofiles>=23.2.1,<24.0.0     # Fixed: Updated to meet deepgram-sdk requirement
 
-# Type compatibility (exact versions to avoid conflicts)
-typing_extensions==4.12.2
+# === Type Compatibility ===
+typing_extensions>=4.12.0,<5.0.0
 
-# Security and authentication
-PyJWT==2.9.0
-certifi==2024.8.30
+# === Security and Authentication ===
+PyJWT>=2.9.0,<3.0.0
+certifi>=2024.8.30,<2025.0.0
 
-# Database and caching (exact versions)
-redis==5.0.4
-asyncpg==0.29.0
-sqlalchemy[asyncio]==2.0.36
+# === Database and Caching ===
+redis>=5.0.4,<6.0.0
+asyncpg>=0.29.0,<0.30.0
+sqlalchemy[asyncio]>=2.0.36,<3.0.0
 
-# AWS integration (exact versions)
-boto3==1.35.78
-aws-xray-sdk==2.14.0
+# === AWS Integration ===
+boto3>=1.35.0,<2.0.0
+aws-xray-sdk>=2.14.0,<3.0.0
 
-# MCP server framework
-fastmcp==2.3.3
+# === MCP Server Framework ===
+# Using latest version with compatible dependencies
+fastmcp>=2.5.1,<3.0.0
 
-# Core dependencies (pinned for stability)
-idna==3.10
-sniffio==1.3.1
-anyio==4.6.2
-h11==0.14.0
+# === Core System Dependencies ===
+# These are fundamental and rarely conflict
+idna>=3.10,<4.0.0
+sniffio>=1.3.1,<2.0.0
