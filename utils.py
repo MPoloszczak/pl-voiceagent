@@ -5,7 +5,6 @@ import os
 import time
 from datetime import datetime
 from starlette.websockets import WebSocketState
-import requests
 import base64
 from typing import Dict
 import sys
