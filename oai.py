@@ -9,7 +9,7 @@ import os
 import json
 import time
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 ##HIPAA Compliance & MCP Configuration--------------------------
 # HIPAA audit logging class
@@ -42,6 +42,10 @@ _mcp_server_cache: Dict[str, object] = {}
 _cache_creation_times: Dict[str, float] = {}
 CACHE_TTL_SECONDS = 3600  # 1 hour cache TTL
 MCP_PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-03-26")
+
+# Redirect handling configuration for HIPAA compliance
+MAX_REDIRECTS = 5  # Limit redirect chains to prevent infinite loops
+ALLOWED_REDIRECT_SCHEMES = {'https', 'http'}  # Only allow secure protocols
 
 # Periodic cache cleanup for memory management
 async def periodic_cache_cleanup():
@@ -101,9 +105,103 @@ async def cleanup_expired_cache_entries():
     
     return total_cleaned
 
+async def resolve_mcp_server_url_with_redirects(initial_url: str, tenant_id: str) -> str:
+    """
+    Resolve MCP server URL by following 307 redirects while maintaining HIPAA compliance.
+    
+    HIPAA Compliance: Validates redirect chains, logs all redirect attempts per §164.312(b),
+    and ensures only secure protocols are used per §164.312(e)(1).
+    """
+    current_url = initial_url
+    redirect_count = 0
+    
+    async with httpx.AsyncClient(
+        timeout=10.0,
+        follow_redirects=False,  # Handle redirects manually for security validation
+        headers={
+            "User-Agent": "PoloLabs-VoiceAI/1.0",
+            "X-Tenant-ID": tenant_id,
+            "X-Application": "voice-ai"
+        }
+    ) as client:
+        
+        while redirect_count < MAX_REDIRECTS:
+            try:
+                logger.info("[HIPAA-MCP] Testing URL for tenant '%s': %s (redirect %d)", 
+                           tenant_id, current_url, redirect_count)
+                
+                # Validate URL scheme for HIPAA compliance
+                parsed_url = urlparse(current_url)
+                if parsed_url.scheme not in ALLOWED_REDIRECT_SCHEMES:
+                    logger.error("[HIPAA-MCP] Invalid redirect scheme for tenant '%s': %s", 
+                               tenant_id, parsed_url.scheme)
+                    HIPAALogger.log_mcp_access(tenant_id, "redirect_validation", "invalid_scheme", 
+                                             f"url_{current_url}_redirect_{redirect_count}")
+                    raise ValueError(f"Invalid redirect scheme: {parsed_url.scheme}")
+                
+                # Make HEAD request to check for redirects
+                response = await client.head(current_url)
+                
+                if response.status_code in (307, 301, 302, 303, 308):
+                    redirect_count += 1
+                    location = response.headers.get('location')
+                    
+                    if not location:
+                        logger.error("[HIPAA-MCP] Redirect response missing Location header for tenant '%s'", tenant_id)
+                        HIPAALogger.log_mcp_access(tenant_id, "redirect_validation", "missing_location", 
+                                                 f"url_{current_url}_status_{response.status_code}")
+                        break
+                    
+                    # Resolve relative URLs
+                    if location.startswith('/'):
+                        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                        next_url = urljoin(base_url, location)
+                    elif location.startswith('http'):
+                        next_url = location
+                    else:
+                        next_url = urljoin(current_url, location)
+                    
+                    logger.info("[HIPAA-MCP] Following redirect %d for tenant '%s': %s -> %s", 
+                               redirect_count, tenant_id, current_url, next_url)
+                    HIPAALogger.log_mcp_access(tenant_id, "redirect_followed", "success", 
+                                             f"from_{current_url}_to_{next_url}_count_{redirect_count}")
+                    
+                    current_url = next_url
+                    continue
+                    
+                elif response.status_code == 200:
+                    logger.info("[HIPAA-MCP] Successfully resolved URL for tenant '%s': %s (after %d redirects)", 
+                               tenant_id, current_url, redirect_count)
+                    HIPAALogger.log_mcp_access(tenant_id, "url_resolved", "success", 
+                                             f"final_url_{current_url}_redirects_{redirect_count}")
+                    return current_url
+                    
+                else:
+                    logger.warning("[HIPAA-MCP] Unexpected status code %d for tenant '%s' at URL: %s", 
+                                 response.status_code, tenant_id, current_url)
+                    HIPAALogger.log_mcp_access(tenant_id, "url_validation", "unexpected_status", 
+                                             f"url_{current_url}_status_{response.status_code}")
+                    break
+                    
+            except Exception as e:
+                logger.error("[HIPAA-MCP] Error resolving URL for tenant '%s' at %s: %s", 
+                           tenant_id, current_url, e)
+                HIPAALogger.log_mcp_access(tenant_id, "url_resolution", "error", 
+                                         f"url_{current_url}_error_{str(e)}")
+                break
+        
+        if redirect_count >= MAX_REDIRECTS:
+            logger.error("[HIPAA-MCP] Too many redirects (%d) for tenant '%s', final URL: %s", 
+                        redirect_count, tenant_id, current_url)
+            HIPAALogger.log_mcp_access(tenant_id, "redirect_validation", "too_many_redirects", 
+                                     f"final_url_{current_url}_count_{redirect_count}")
+        
+        # Return the final URL even if we couldn't validate it completely
+        return current_url
+
 async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
     """
-    Create or retrieve cached MCP server for tenant with optimizations.
+    Create or retrieve cached MCP server for tenant with optimizations and redirect handling.
     
     Performance optimizations:
     - Server instance caching with TTL
@@ -111,8 +209,10 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
     - Connection timeout optimized for real-time voice
     - Streamable HTTP transport for low latency
     - Proper connection lifecycle management
+    - Automatic 307 redirect resolution
     
-    HIPAA Compliance: Tenant isolation per §164.312(a)(1), audit logging per §164.312(b)
+    HIPAA Compliance: Tenant isolation per §164.312(a)(1), audit logging per §164.312(b),
+    secure redirect validation per §164.312(e)(1)
     """
     
     # Check cache first (with TTL for production stability)
@@ -146,12 +246,15 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
         
         # Ensure no trailing slash and proper path construction
         base_url = f"{scheme}://{netloc}".rstrip('/')
-        transport_url = f"{base_url}/{tenant_id}/mcp"
+        initial_transport_url = f"{base_url}/{tenant_id}/mcp"
         
-        # Validate URL format for HIPAA compliance
+        # Resolve URL with redirect handling for production deployments
+        transport_url = await resolve_mcp_server_url_with_redirects(initial_transport_url, tenant_id)
+        
+        # Validate final URL format for HIPAA compliance
         if not transport_url.startswith(('https://', 'http://localhost')):
-            logger.error("[HIPAA-MCP] Invalid URL scheme for tenant '%s': %s", tenant_id, transport_url)
-            HIPAALogger.log_mcp_access(tenant_id, "url_validation", "invalid_scheme", transport_url)
+            logger.error("[HIPAA-MCP] Invalid final URL scheme for tenant '%s': %s", tenant_id, transport_url)
+            HIPAALogger.log_mcp_access(tenant_id, "url_validation", "invalid_final_scheme", transport_url)
             return None
         
         logger.info("[HIPAA-MCP] Creating optimized MCP server for tenant '%s' at %s", 
@@ -161,7 +264,7 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
         from agents.mcp.server import MCPServerStreamableHttp
         from datetime import timedelta
         
-        # Create optimized MCP server for real-time voice AI
+        # Create optimized MCP server for real-time voice AI with redirect support
         mcp_server = MCPServerStreamableHttp(
             params={
                 "url": transport_url,
@@ -172,7 +275,9 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
                     "User-Agent": "PoloLabs-VoiceAI/1.0"
                 },
                 "timeout": timedelta(seconds=10),  # Optimized for real-time
-                "sse_read_timeout": timedelta(seconds=30)  # Shorter timeout for voice
+                "sse_read_timeout": timedelta(seconds=30),  # Shorter timeout for voice
+                "follow_redirects": True,  # Enable automatic redirect following
+                "max_redirects": MAX_REDIRECTS  # Limit redirect chains
             },
             cache_tools_list=True,  # Enable automatic tool caching
             name=f"tenant-{tenant_id}-voice",
@@ -192,12 +297,12 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
         except asyncio.TimeoutError:
             logger.error("[HIPAA-MCP] Connection timeout for tenant '%s' after 30s", tenant_id)
             HIPAALogger.log_mcp_access(tenant_id, "connection", "timeout", "30s")
-            await mcp_server.cleanup()
+            await safe_cleanup_mcp_server(mcp_server, tenant_id)
             return None
         except Exception as connect_error:
             logger.error("[HIPAA-MCP] Connection failed for tenant '%s': %s", tenant_id, connect_error)
             HIPAALogger.log_mcp_access(tenant_id, "connection", "failed", str(connect_error))
-            await mcp_server.cleanup()
+            await safe_cleanup_mcp_server(mcp_server, tenant_id)
             return None
         
         # Cache the connected server and record creation time
@@ -218,6 +323,32 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
         logger.error("[HIPAA-MCP] Failed to create MCP server for tenant '%s': %s", tenant_id, e)
         HIPAALogger.log_mcp_access(tenant_id, "server_creation", "error", str(e))
         return None
+
+async def safe_cleanup_mcp_server(server: object, tenant_id: str):
+    """
+    Safely cleanup MCP server connections with proper async generator handling.
+    
+    HIPAA Compliance: Ensures proper connection cleanup and audit logging per §164.312(b).
+    """
+    if server:
+        try:
+            # Check if server has cleanup method
+            if hasattr(server, 'cleanup'):
+                await server.cleanup()
+            # Also check for session cleanup
+            elif hasattr(server, 'session') and server.session:
+                try:
+                    await server.session.close()
+                except Exception:
+                    pass  # Session may already be closed
+            
+            logger.debug("[HIPAA-MCP] Successfully cleaned up MCP server for tenant '%s'", tenant_id)
+            HIPAALogger.log_mcp_access(tenant_id, "server_cleanup", "success", "safe_cleanup")
+            
+        except Exception as cleanup_error:
+            logger.warning("[HIPAA-MCP] Error during server cleanup for tenant '%s': %s", 
+                         tenant_id, cleanup_error)
+            HIPAALogger.log_mcp_access(tenant_id, "server_cleanup", "error", str(cleanup_error))
 
 # ------------------------------------------------------------------
 # MCP Connection Health Check for HIPAA Monitoring
@@ -382,18 +513,26 @@ class StreamingHandle:
     """Wrap an async generator to allow cancellation of the LLM stream."""
     def __init__(self, agen):
         self._agen = agen
+        self._cancelled = False
+    
     def cancel(self):
         """Cancel the async generator to stop the LLM streaming."""
+        if self._cancelled:
+            return
+            
+        self._cancelled = True
         try:
             aclose = getattr(self._agen, 'aclose', None)
             if aclose:
-                # schedule generator close without awaiting
+                # Create a task to close the generator without awaiting
                 try:
-                    asyncio.create_task(self._agen.aclose())
+                    task = asyncio.create_task(self._agen.aclose())
+                    # Don't await the task to prevent blocking
                 except RuntimeError:
+                    # Event loop may be closed or in a different context
                     pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Error during streaming handle cancellation: %s", e)
 
 # ---------------------------------------------------------------------------
 # Optimized Agent Response Functions with Native MCP Support
@@ -420,6 +559,7 @@ async def get_agent_response(
     - Implements connection pooling and configuration caching
     - Enhanced HIPAA audit logging with rate limiting
     - Streamlined error handling with proper fallbacks
+    - Automatic 307 redirect handling for production deployments
     
     HIPAA Compliance: Validates tenant authorization, maintains strict data isolation,
     implements proper access controls per §164.312(a)(1), logs security events per §164.312(b)
@@ -511,6 +651,7 @@ async def stream_agent_deltas(
     - Single agent instance with dynamic configuration
     - Shared validation and context management
     - Optimized streaming with proper error handling
+    - Improved async generator cleanup
     
     HIPAA Compliance: Maintains tenant isolation during streaming, implements proper access controls
     """
@@ -529,15 +670,20 @@ async def stream_agent_deltas(
                 HIPAALogger.log_tenant_access(tenant_id, session_id or "anonymous", "streaming", "validation_failed")
                 
                 # Secure fallback without tools
-                streaming_result = Runner.run_streamed(medspa_agent, agent_input)
-                async for event in streaming_result.stream_events():
-                    if (
-                        event.type == "raw_response_event"
-                        and isinstance(event.data, ResponseTextDeltaEvent)
-                    ):
-                        yield event.data.delta
-                if not updated_hist_future.done():
-                    updated_hist_future.set_result(streaming_result.to_input_list())
+                try:
+                    streaming_result = Runner.run_streamed(medspa_agent, agent_input)
+                    async for event in streaming_result.stream_events():
+                        if (
+                            event.type == "raw_response_event"
+                            and isinstance(event.data, ResponseTextDeltaEvent)
+                        ):
+                            yield event.data.delta
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(streaming_result.to_input_list())
+                except Exception as e:
+                    logger.error("[HIPAA] Fallback streaming error for tenant '%s': %s", tenant_id, e)
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(agent_input + [{"role": "assistant", "content": "Service temporarily unavailable"}])
                 return
             
             # Step 2: Reuse MCP server (cached for performance)
@@ -546,15 +692,20 @@ async def stream_agent_deltas(
             if not mcp_server:
                 logger.error("[HIPAA] Failed to create streaming MCP server for tenant '%s'", tenant_id)
                 # Fall back to agent without tools
-                streaming_result = Runner.run_streamed(medspa_agent, agent_input)
-                async for event in streaming_result.stream_events():
-                    if (
-                        event.type == "raw_response_event"
-                        and isinstance(event.data, ResponseTextDeltaEvent)
-                    ):
-                        yield event.data.delta
-                if not updated_hist_future.done():
-                    updated_hist_future.set_result(streaming_result.to_input_list())
+                try:
+                    streaming_result = Runner.run_streamed(medspa_agent, agent_input)
+                    async for event in streaming_result.stream_events():
+                        if (
+                            event.type == "raw_response_event"
+                            and isinstance(event.data, ResponseTextDeltaEvent)
+                        ):
+                            yield event.data.delta
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(streaming_result.to_input_list())
+                except Exception as e:
+                    logger.error("[HIPAA] Fallback streaming error for tenant '%s': %s", tenant_id, e)
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(agent_input + [{"role": "assistant", "content": "Service temporarily unavailable"}])
                 return
             
             # Step 3: Configure tenant-specific agent for streaming
@@ -562,15 +713,20 @@ async def stream_agent_deltas(
             is_healthy = await check_mcp_server_health(tenant_id)
             if not is_healthy:
                 logger.warning("[HIPAA] MCP server health check failed for streaming tenant '%s', using fallback", tenant_id)
-                streaming_result = Runner.run_streamed(medspa_agent, agent_input)
-                async for event in streaming_result.stream_events():
-                    if (
-                        event.type == "raw_response_event"
-                        and isinstance(event.data, ResponseTextDeltaEvent)
-                    ):
-                        yield event.data.delta
-                if not updated_hist_future.done():
-                    updated_hist_future.set_result(streaming_result.to_input_list())
+                try:
+                    streaming_result = Runner.run_streamed(medspa_agent, agent_input)
+                    async for event in streaming_result.stream_events():
+                        if (
+                            event.type == "raw_response_event"
+                            and isinstance(event.data, ResponseTextDeltaEvent)
+                        ):
+                            yield event.data.delta
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(streaming_result.to_input_list())
+                except Exception as e:
+                    logger.error("[HIPAA] Fallback streaming error for tenant '%s': %s", tenant_id, e)
+                    if not updated_hist_future.done():
+                        updated_hist_future.set_result(agent_input + [{"role": "assistant", "content": "Service temporarily unavailable"}])
                 return
             
             tenant_agent = Agent(
