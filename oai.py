@@ -9,7 +9,7 @@ import os
 import json
 import time
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 
 ##HIPAA Compliance & MCP Configuration--------------------------
 # HIPAA audit logging class
@@ -42,10 +42,6 @@ _mcp_server_cache: Dict[str, object] = {}
 _cache_creation_times: Dict[str, float] = {}
 CACHE_TTL_SECONDS = 3600  # 1 hour cache TTL
 MCP_PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-03-26")
-
-# Redirect handling configuration for HIPAA compliance
-MAX_REDIRECTS = 5  # Limit redirect chains to prevent infinite loops
-ALLOWED_REDIRECT_SCHEMES = {'https', 'http'}  # Only allow secure protocols
 
 # Periodic cache cleanup for memory management
 async def periodic_cache_cleanup():
@@ -105,103 +101,9 @@ async def cleanup_expired_cache_entries():
     
     return total_cleaned
 
-async def resolve_mcp_server_url_with_redirects(initial_url: str, tenant_id: str) -> str:
-    """
-    Resolve MCP server URL by following 307 redirects while maintaining HIPAA compliance.
-    
-    HIPAA Compliance: Validates redirect chains, logs all redirect attempts per §164.312(b),
-    and ensures only secure protocols are used per §164.312(e)(1).
-    """
-    current_url = initial_url
-    redirect_count = 0
-    
-    async with httpx.AsyncClient(
-        timeout=10.0,
-        follow_redirects=False,  # Handle redirects manually for security validation
-        headers={
-            "User-Agent": "PoloLabs-VoiceAI/1.0",
-            "X-Tenant-ID": tenant_id,
-            "X-Application": "voice-ai"
-        }
-    ) as client:
-        
-        while redirect_count < MAX_REDIRECTS:
-            try:
-                logger.info("[HIPAA-MCP] Testing URL for tenant '%s': %s (redirect %d)", 
-                           tenant_id, current_url, redirect_count)
-                
-                # Validate URL scheme for HIPAA compliance
-                parsed_url = urlparse(current_url)
-                if parsed_url.scheme not in ALLOWED_REDIRECT_SCHEMES:
-                    logger.error("[HIPAA-MCP] Invalid redirect scheme for tenant '%s': %s", 
-                               tenant_id, parsed_url.scheme)
-                    HIPAALogger.log_mcp_access(tenant_id, "redirect_validation", "invalid_scheme", 
-                                             f"url_{current_url}_redirect_{redirect_count}")
-                    raise ValueError(f"Invalid redirect scheme: {parsed_url.scheme}")
-                
-                # Make HEAD request to check for redirects
-                response = await client.head(current_url)
-                
-                if response.status_code in (307, 301, 302, 303, 308):
-                    redirect_count += 1
-                    location = response.headers.get('location')
-                    
-                    if not location:
-                        logger.error("[HIPAA-MCP] Redirect response missing Location header for tenant '%s'", tenant_id)
-                        HIPAALogger.log_mcp_access(tenant_id, "redirect_validation", "missing_location", 
-                                                 f"url_{current_url}_status_{response.status_code}")
-                        break
-                    
-                    # Resolve relative URLs
-                    if location.startswith('/'):
-                        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-                        next_url = urljoin(base_url, location)
-                    elif location.startswith('http'):
-                        next_url = location
-                    else:
-                        next_url = urljoin(current_url, location)
-                    
-                    logger.info("[HIPAA-MCP] Following redirect %d for tenant '%s': %s -> %s", 
-                               redirect_count, tenant_id, current_url, next_url)
-                    HIPAALogger.log_mcp_access(tenant_id, "redirect_followed", "success", 
-                                             f"from_{current_url}_to_{next_url}_count_{redirect_count}")
-                    
-                    current_url = next_url
-                    continue
-                    
-                elif response.status_code == 200:
-                    logger.info("[HIPAA-MCP] Successfully resolved URL for tenant '%s': %s (after %d redirects)", 
-                               tenant_id, current_url, redirect_count)
-                    HIPAALogger.log_mcp_access(tenant_id, "url_resolved", "success", 
-                                             f"final_url_{current_url}_redirects_{redirect_count}")
-                    return current_url
-                    
-                else:
-                    logger.warning("[HIPAA-MCP] Unexpected status code %d for tenant '%s' at URL: %s", 
-                                 response.status_code, tenant_id, current_url)
-                    HIPAALogger.log_mcp_access(tenant_id, "url_validation", "unexpected_status", 
-                                             f"url_{current_url}_status_{response.status_code}")
-                    break
-                    
-            except Exception as e:
-                logger.error("[HIPAA-MCP] Error resolving URL for tenant '%s' at %s: %s", 
-                           tenant_id, current_url, e)
-                HIPAALogger.log_mcp_access(tenant_id, "url_resolution", "error", 
-                                         f"url_{current_url}_error_{str(e)}")
-                break
-        
-        if redirect_count >= MAX_REDIRECTS:
-            logger.error("[HIPAA-MCP] Too many redirects (%d) for tenant '%s', final URL: %s", 
-                        redirect_count, tenant_id, current_url)
-            HIPAALogger.log_mcp_access(tenant_id, "redirect_validation", "too_many_redirects", 
-                                     f"final_url_{current_url}_count_{redirect_count}")
-        
-        # Return the final URL even if we couldn't validate it completely
-        return current_url
-
 async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
     """
-    Create or retrieve cached MCP server for tenant with optimizations and redirect handling.
+    Create or retrieve cached MCP server for tenant with optimizations.
     
     Performance optimizations:
     - Server instance caching with TTL
@@ -209,10 +111,10 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
     - Connection timeout optimized for real-time voice
     - Streamable HTTP transport for low latency
     - Proper connection lifecycle management
-    - Automatic 307 redirect resolution
+    - Direct URL construction without redirect handling
     
     HIPAA Compliance: Tenant isolation per §164.312(a)(1), audit logging per §164.312(b),
-    secure redirect validation per §164.312(e)(1)
+    direct HTTPS connections per §164.312(e)(1)
     """
     
     # Check cache first (with TTL for production stability)
@@ -238,23 +140,20 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
             _cache_creation_times.pop(tenant_id, None)
     
     try:
-        # Construct tenant-specific MCP URL (no trailing slash per server spec)
+        # Construct tenant-specific MCP URL directly (server now mounts at /{tenant_id}/mcp)
         raw_base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com")
         parsed = urlparse(raw_base)
         scheme = parsed.scheme or "https"
         netloc = parsed.netloc or parsed.path
         
-        # Ensure no trailing slash and proper path construction
+        # Construct direct URL to the mounted MCP endpoint
         base_url = f"{scheme}://{netloc}".rstrip('/')
-        initial_transport_url = f"{base_url}/{tenant_id}/mcp"
+        transport_url = f"{base_url}/{tenant_id}/mcp"
         
-        # Resolve URL with redirect handling for production deployments
-        transport_url = await resolve_mcp_server_url_with_redirects(initial_transport_url, tenant_id)
-        
-        # Validate final URL format for HIPAA compliance
+        # Validate URL format for HIPAA compliance
         if not transport_url.startswith(('https://', 'http://localhost')):
-            logger.error("[HIPAA-MCP] Invalid final URL scheme for tenant '%s': %s", tenant_id, transport_url)
-            HIPAALogger.log_mcp_access(tenant_id, "url_validation", "invalid_final_scheme", transport_url)
+            logger.error("[HIPAA-MCP] Invalid URL scheme for tenant '%s': %s", tenant_id, transport_url)
+            HIPAALogger.log_mcp_access(tenant_id, "url_validation", "invalid_scheme", transport_url)
             return None
         
         logger.info("[HIPAA-MCP] Creating optimized MCP server for tenant '%s' at %s", 
@@ -264,7 +163,7 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
         from agents.mcp.server import MCPServerStreamableHttp
         from datetime import timedelta
         
-        # Create optimized MCP server for real-time voice AI with redirect support
+        # Create optimized MCP server for real-time voice AI
         mcp_server = MCPServerStreamableHttp(
             params={
                 "url": transport_url,
@@ -276,8 +175,8 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
                 },
                 "timeout": timedelta(seconds=10),  # Optimized for real-time
                 "sse_read_timeout": timedelta(seconds=30),  # Shorter timeout for voice
-                "follow_redirects": True,  # Enable automatic redirect following
-                "max_redirects": MAX_REDIRECTS  # Limit redirect chains
+                "follow_redirects": False,  # No redirects expected with direct mounting
+                "max_redirects": 0  # Disable redirect following
             },
             cache_tools_list=True,  # Enable automatic tool caching
             name=f"tenant-{tenant_id}-voice",
@@ -514,6 +413,7 @@ class StreamingHandle:
     def __init__(self, agen):
         self._agen = agen
         self._cancelled = False
+        self._cleanup_task = None
     
     def cancel(self):
         """Cancel the async generator to stop the LLM streaming."""
@@ -521,18 +421,33 @@ class StreamingHandle:
             return
             
         self._cancelled = True
+        
+        # Schedule cleanup asynchronously to avoid blocking and race conditions
         try:
-            aclose = getattr(self._agen, 'aclose', None)
-            if aclose:
-                # Create a task to close the generator without awaiting
+            if hasattr(self._agen, 'aclose'):
+                # Create a fire-and-forget cleanup task
                 try:
-                    task = asyncio.create_task(self._agen.aclose())
-                    # Don't await the task to prevent blocking
+                    loop = asyncio.get_running_loop()
+                    self._cleanup_task = loop.create_task(self._safe_cleanup())
                 except RuntimeError:
                     # Event loop may be closed or in a different context
-                    pass
+                    logger.debug("Could not schedule async generator cleanup: event loop not available")
         except Exception as e:
-            logger.debug("Error during streaming handle cancellation: %s", e)
+            logger.debug("Error during streaming handle cancellation setup: %s", e)
+    
+    async def _safe_cleanup(self):
+        """Safely close the async generator with proper error handling."""
+        try:
+            if hasattr(self._agen, 'aclose'):
+                await self._agen.aclose()
+        except RuntimeError as e:
+            if "already running" in str(e):
+                # Generator is still actively running, which is expected during cancellation
+                logger.debug("Async generator cleanup skipped: generator still running")
+            else:
+                logger.debug("Async generator cleanup error: %s", e)
+        except Exception as e:
+            logger.debug("Unexpected error during async generator cleanup: %s", e)
 
 # ---------------------------------------------------------------------------
 # Optimized Agent Response Functions with Native MCP Support
