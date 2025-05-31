@@ -159,11 +159,11 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
         logger.info("[HIPAA-MCP] Creating optimized MCP server for tenant '%s' at %s", 
                    tenant_id, transport_url)
         
-        # Import OpenAI Agents SDK MCP classes
+        # Import OpenAI Agents SDK MCP classes - using latest 2025-03-26 compatible version
         from agents.mcp.server import MCPServerStreamableHttp
         from datetime import timedelta
         
-        # Create optimized MCP server for real-time voice AI
+        # Create optimized MCP server for real-time voice AI using 2025-03-26 protocol
         mcp_server = MCPServerStreamableHttp(
             params={
                 "url": transport_url,
@@ -171,7 +171,8 @@ async def create_optimized_mcp_server(tenant_id: str) -> Optional[object]:
                     "X-MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
                     "X-Tenant-ID": tenant_id,
                     "X-Application": "voice-ai",
-                    "User-Agent": "PoloLabs-VoiceAI/1.0"
+                    "User-Agent": "PoloLabs-VoiceAI/1.0",
+                    "Content-Type": "application/json"
                 },
                 "timeout": timedelta(seconds=10),  # Optimized for real-time
                 "sse_read_timeout": timedelta(seconds=30),  # Shorter timeout for voice
