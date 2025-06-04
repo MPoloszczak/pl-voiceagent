@@ -13,6 +13,9 @@ from oai import initialize_agent, cleanup_mcp_server
 
 patch_all()  # instrument std libs
 
+# Create the singleton instance after all imports are resolved
+deepgram_service = get_deepgram_service()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handle application startup and shutdown events."""
@@ -60,15 +63,14 @@ async def lifespan(app: FastAPI):
         logger.warning(f"⚠️ Error during MCP server cleanup: {e}")
     
     # Close all active Deepgram connections
-    # We'll get the call SIDs from the active deepgram connections
-    for call_sid in list(deepgram_service.active_connections.keys()):
-        await deepgram_service.close_connection(call_sid)
+    try:
+        for call_sid in list(deepgram_service.active_connections.keys()):
+            await deepgram_service.close_connection(call_sid)
+    except Exception as e:
+        logger.warning(f"⚠️ Error during Deepgram cleanup: {e}")
 
 # Initialize FastAPI app with lifespan
 app = FastAPI(title="Programmable Voice Agent", lifespan=lifespan)
-
-# Create the singleton instance after all imports are resolved
-deepgram_service = get_deepgram_service()
 
 # ----- API Endpoints -----
 
