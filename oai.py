@@ -165,7 +165,7 @@ async def create_mcp_server() -> Optional[object]:
         # Connect the server
         logger.info("[HIPAA-MCP] Connecting to MCP server with client_id=%s session_id=%s", 
                    _session_manager.get_client_id(), session_id)
-        await asyncio.wait_for(mcp_server.connect(), timeout=30.0)
+        await mcp_server.connect()
         
         # Verify connection by listing tools
         tools = await asyncio.wait_for(mcp_server.list_tools(), timeout=10.0)
