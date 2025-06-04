@@ -3,6 +3,7 @@ import uvicorn
 from fastapi import FastAPI, Request, WebSocket, Response
 from aws_xray_sdk.core import patch_all
 import time
+from contextlib import asynccontextmanager
 
 from utils import logger, setup_logging
 from twilio import twilio_service
@@ -12,15 +13,10 @@ from oai import initialize_agent, cleanup_mcp_server
 
 patch_all()  # instrument std libs
 
-# Initialize FastAPI app
-app = FastAPI(title="Programmable Voice Agent")
-
-# Create the singleton instance after all imports are resolved
-deepgram_service = get_deepgram_service()
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize services on application startup."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle application startup and shutdown events."""
+    # Startup
     logger.info("Starting Programmable Voice Agent service")
     
     # Log environment variable status
@@ -41,18 +37,19 @@ async def startup_event():
     if not openai_api_key:
         logger.error("OPENAI_API_KEY is missing. Agent responses will not work.")
     
-    # Initialize MCP agent with server connection
+    # Initialize MCP agent with server connection - non-blocking fallback
     try:
         await initialize_agent()
         logger.info("✅ MCP agent initialization completed successfully")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize MCP agent: {e}")
-        logger.warning("⚠️ Application will continue with basic agent functionality")
+        logger.warning(f"⚠️ MCP agent initialization failed during startup: {e}")
+        logger.info("🔄 Application will continue and retry MCP connection on first agent invocation")
+        # HIPAA Compliance: Log startup failure for audit trail per §164.312(b)
+        logger.info("[HIPAA-AUDIT] mcp_startup_failure logged for compliance tracking")
     
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up resources on application shutdown."""
+    yield
+    
+    # Shutdown
     logger.info("Shutting down Programmable Voice Agent service")
     
     # Clean up MCP server connection
@@ -66,6 +63,12 @@ async def shutdown_event():
     # We'll get the call SIDs from the active deepgram connections
     for call_sid in list(deepgram_service.active_connections.keys()):
         await deepgram_service.close_connection(call_sid)
+
+# Initialize FastAPI app with lifespan
+app = FastAPI(title="Programmable Voice Agent", lifespan=lifespan)
+
+# Create the singleton instance after all imports are resolved
+deepgram_service = get_deepgram_service()
 
 # ----- API Endpoints -----
 

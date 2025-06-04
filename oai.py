@@ -282,11 +282,14 @@ adhering to HIPAA guidelines for protected health information.
 
 # Initialize MCP-enabled agent at startup
 _agent_with_mcp: Optional[Agent] = None
+_mcp_initialization_attempted: bool = False
+_mcp_retry_on_invocation: bool = True
 
 async def initialize_agent():
     """Initialize the agent with MCP server connection."""
-    global _agent_with_mcp
+    global _agent_with_mcp, _mcp_initialization_attempted, _mcp_retry_on_invocation
     
+    _mcp_initialization_attempted = True
     mcp_server = await create_mcp_server()
     
     if mcp_server:
@@ -296,11 +299,49 @@ async def initialize_agent():
             model=medspa_agent.model,
             mcp_servers=[mcp_server]
         )
+        _mcp_retry_on_invocation = False  # Success, no need to retry
         logger.info("[HIPAA-MCP] Agent initialized with MCP server, client_id=%s", 
                    _session_manager.get_client_id())
+        HIPAALogger.log_mcp_access("agent_initialization", "success", f"client_id={_session_manager.get_client_id()}")
     else:
         _agent_with_mcp = medspa_agent
         logger.warning("[HIPAA-MCP] Agent initialized without MCP server (fallback)")
+        HIPAALogger.log_mcp_access("agent_initialization", "fallback_mode", "no_mcp_server")
+
+async def ensure_agent_initialized():
+    """Ensure agent is initialized, with MCP retry on first invocation if needed."""
+    global _agent_with_mcp, _mcp_initialization_attempted, _mcp_retry_on_invocation
+    
+    # If agent is not initialized at all, initialize it
+    if not _agent_with_mcp:
+        await initialize_agent()
+        return
+    
+    # If MCP failed during startup and this is the first invocation, retry once
+    if _mcp_retry_on_invocation and _mcp_initialization_attempted:
+        logger.info("[HIPAA-MCP] Retrying MCP server connection on first agent invocation")
+        HIPAALogger.log_mcp_access("mcp_retry_invocation", "started", "first_call_retry")
+        
+        try:
+            mcp_server = await create_mcp_server()
+            if mcp_server:
+                _agent_with_mcp = Agent(
+                    name=medspa_agent.name,
+                    instructions=medspa_agent.instructions,
+                    model=medspa_agent.model,
+                    mcp_servers=[mcp_server]
+                )
+                logger.info("[HIPAA-MCP] ✅ MCP server connection successful on retry")
+                HIPAALogger.log_mcp_access("mcp_retry_invocation", "success", "connected_on_retry")
+            else:
+                logger.warning("[HIPAA-MCP] ⚠️ MCP server connection retry failed, continuing with fallback")
+                HIPAALogger.log_mcp_access("mcp_retry_invocation", "failed", "fallback_maintained")
+        except Exception as e:
+            logger.warning(f"[HIPAA-MCP] ⚠️ MCP server retry failed: {e}")
+            HIPAALogger.log_mcp_access("mcp_retry_invocation", "error", str(e))
+        
+        # Disable further retry attempts regardless of outcome
+        _mcp_retry_on_invocation = False
 
 def get_agent() -> Agent:
     """Get the configured agent (with or without MCP)."""
@@ -367,9 +408,8 @@ async def get_agent_response(
     """
     
     async with managed_session_context(session_id) as tracked_session_id:
-        # Ensure agent is initialized
-        if not _agent_with_mcp:
-            await initialize_agent()
+        # Ensure agent is initialized with MCP retry capability
+        await ensure_agent_initialized()
         
         agent = get_agent()
         agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
@@ -404,9 +444,8 @@ async def stream_agent_deltas(
     """
 
     async with managed_session_context(session_id) as tracked_session_id:
-        # Ensure agent is initialized
-        if not _agent_with_mcp:
-            await initialize_agent()
+        # Ensure agent is initialized with MCP retry capability
+        await ensure_agent_initialized()
         
         agent = get_agent()
         agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
