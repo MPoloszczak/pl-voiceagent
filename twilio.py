@@ -10,15 +10,13 @@ from starlette.websockets import WebSocketState
 import base64
 from collections import deque
 import os
-import httpx
 
 from utils import logger, TWIML_STREAM_TEMPLATE, send_periodic_pings, send_silence_keepalive, cancel_keepalive_if_needed
 from dpg import get_deepgram_service
 from ell import tts_service
-from oai import stream_agent_deltas, MCP_PROTOCOL_VERSION
+from oai import stream_agent_deltas
 from vad_events import interruption_manager
-from services.cache import get_json, set_json  
-from services import tenant_map  # cross-worker CallSid➜tenant mapping
+from services.cache import get_json, set_json, CacheWriteError
 
 class TwilioService:
     """Service for handling Twilio calls and WebSocket interactions"""
@@ -28,8 +26,6 @@ class TwilioService:
         self.active_connections: Dict[str, WebSocket] = {}
         self.websocket_connection_attempts: Dict[str, List[Dict[str, Any]]] = {}
         self.call_to_stream_sid: Dict[str, str] = {}
-        # Map call_sid -> tenant id to build cache keys
-        self.call_to_tenant: Dict[str, str] = {}
         # Track keepalive tasks for each session
         self.keepalive_tasks: Dict[str, asyncio.Task] = {}
         # Track received media frame counts for logging
@@ -77,30 +73,6 @@ class TwilioService:
             )
         
         logger.info(f"Incoming call received: {call_sid}")
-        
-        # Determine tenant for this call SID early so that subsequent WebSocket
-        # traffic can reuse the correct context (avoids accidental override to
-        # the generic `stream` host).  Prefer the explicit X-Tenant-Id header
-        # set by API Gateway; fall back to the sub-domain of the Host header –
-        # this mirrors logic in middlewares/tenant.py but avoids an extra DB
-        # round-trip.  Doing this here guarantees that the later WebSocket
-        # handler will have the authoritative tenant mapping and satisfies the
-        # HIPAA §164.312(a)(1) Access Control requirement to **consistently**
-        # scope data access per tenant.
-        tenant_header = request.headers.get("x-tenant-id", "").strip().lower()
-        if tenant_header:
-            tenant_part = tenant_header.split(".")[0]
-        else:
-            host_hdr = request.headers.get("host", "")
-            tenant_part = host_hdr.split(":")[0].split(".")[0].lower() if host_hdr else "default"
-
-        # Persist mapping only if we have not seen this CallSid before
-        if call_sid not in self.call_to_tenant:
-            resolved_tenant = tenant_part or "default"
-            self.call_to_tenant[call_sid] = resolved_tenant
-            logger.debug("Mapped CallSid %s ➜ tenant '%s'", call_sid, resolved_tenant)
-            # Persist mapping so other workers can retrieve it (horizontal scaling safe)
-            await tenant_map.set_tenant(call_sid, resolved_tenant)
         
         # Log additional Twilio parameters for debugging
         try:
@@ -198,263 +170,88 @@ class TwilioService:
             except Exception as e:
                 logger.error(f"❌ Could not set DeepgramService main_loop: {e}")
             
-            # Start the ping task with a placeholder session ID until we get CallSid
-            placeholder_id = f"pending_{uuid.uuid4()}"
+            # Generate placeholder session ID for early tracking
+            placeholder_id = str(uuid.uuid4())[:8]
             self.active_connections[placeholder_id] = websocket
-            logger.info(f"🔍 Starting ping task for WebSocket pending session")
-            ping_task = asyncio.create_task(send_periodic_pings(websocket, placeholder_id))
             
-            try:
-                # Wait for initial messages to extract CallSid
-                logger.info(f"🔍 Waiting for initial messages to extract CallSid")
+            logger.info(f"📬 Awaiting initial message to extract CallSid (timeout: {callsid_timeout}s)")
+            
+            # Wait for the first message to extract CallSid
+            while not call_sid:
+                timeout_elapsed = datetime.now().timestamp() - callsid_start_time
+                if timeout_elapsed >= callsid_timeout:
+                    logger.error(f"❌ CallSid timeout after {callsid_timeout}s, closing WebSocket")
+                    await websocket.close(1008, "CallSid timeout")
+                    return
                 
-                # Initial loop to wait for CallSid
-                while not call_sid:
-                    # Check for CallSid timeout
-                    if datetime.now().timestamp() - callsid_start_time > callsid_timeout:
-                        error_msg = f"Timeout waiting for CallSid after {callsid_timeout} seconds"
-                        logger.error(f"❌ {error_msg}")
-                        await websocket.close(code=1008, reason=error_msg)
-                        return
+                try:
+                    message = await asyncio.wait_for(websocket.receive(), timeout=1.0)
                     
-                    # Check for inactivity timeout
-                    if datetime.now().timestamp() - last_activity_time > inactivity_timeout:
-                        error_msg = f"Inactivity timeout reached while waiting for CallSid"
-                        logger.error(f"❌ {error_msg}")
-                        await websocket.close(code=1008, reason=error_msg)
-                        return
-                    
-                    # Use wait_for to add a timeout to receive operation
-                    try:
-                        message = await asyncio.wait_for(websocket.receive(), timeout=1.0)
-                        # Update last activity time whenever a message is received
-                        last_activity_time = datetime.now().timestamp()
-                    except asyncio.TimeoutError:
-                        # No message received, continue the loop to check timeouts
-                        continue
-                    except RuntimeError as re:
-                        # Handle "Cannot call 'receive' once a disconnect message has been received"
-                        if "disconnect message has been received" in str(re):
-                            logger.info(f"WebSocket disconnected while waiting for CallSid")
-                            return
-                        else:
-                            # Re-raise if it's a different RuntimeError
-                            raise re
-                    
-                    logger.debug(f"🔍 Received WebSocket message while waiting for CallSid")
-                    
-                    # Try to extract CallSid from the message
                     if "text" in message:
-                        text_data = message["text"]
                         try:
-                            data = json.loads(text_data)
+                            data = json.loads(message["text"])
                             event = data.get("event")
                             
                             if event == "start":
-                                logger.info(f"Stream started event received")
-                                stream_sid = data.get("streamSid")
-                                if stream_sid:
-                                    logger.info(f"✅ Extracted Stream SID: {stream_sid}")
-                                    start_call_sid = data.get("start", {}).get("callSid")
-                                    if start_call_sid:
-                                        call_sid = start_call_sid
+                                # Extract CallSid from the start event
+                                call_sid = data.get("start", {}).get("callSid")
+                                stream_sid = data.get("start", {}).get("streamSid")
+                                
+                                if call_sid:
+                                    logger.info(f"🎯 CallSid identified: {call_sid}, StreamSid: {stream_sid}")
+                                    
+                                    # Store Stream SID for later use
+                                    if stream_sid:
                                         self.call_to_stream_sid[call_sid] = stream_sid
-                                        session_id = f"{call_sid}_{uuid.uuid4()}"
-                                        self.active_connections[session_id] = websocket
-                                        
-                                        # Cache MCP session ID for this call
-                                        tenant_id = self.call_to_tenant.get(call_sid)
-                                        await set_json(f"{tenant_id}:session:{call_sid}", session_id)
-                                        
-                                        # Preserve earlier tenant mapping if present; otherwise derive
-                                        if call_sid not in self.call_to_tenant:
-                                            # Try cross-worker lookup first (set by /voice webhook)
-                                            mapped = await tenant_map.get_tenant(call_sid)
-                                            if mapped:
-                                                self.call_to_tenant[call_sid] = mapped
-                                            else:
-                                                self.call_to_tenant[call_sid] = tenant_part or "default"
-                                            logger.debug("Mapped CallSid %s ➜ tenant '%s' (derived at WS start)", call_sid, self.call_to_tenant[call_sid])
-                                            # Ensure mapping persisted
-                                            await tenant_map.set_tenant(call_sid, self.call_to_tenant[call_sid])
-                                        
-                                        logger.info(f"🔍 Proactively starting Deepgram connection for call: {call_sid}")
-                                        # Start Deepgram connection in background to reduce TTS latency
-                                        asyncio.create_task(self.deepgram_service.setup_connection(call_sid))
-                                        # Initialize media buffer for this call
-                                        self.media_buffer[call_sid] = deque(maxlen=200)
-                                        try:
-                                            del self.active_connections[placeholder_id]
-                                        except KeyError:
-                                            pass
-                                        
-                                        logger.info(f"Generating welcome message immediately for call {call_sid} with Stream SID {stream_sid}")
-                                        await tts_service.generate_welcome_message(call_sid, websocket, stream_sid)
-                                        
-                                        # Start the silence keep-alive task after welcome message completes
-                                        logger.info(f"Starting silence keep-alive after welcome message for call {call_sid}")
-                                        self.keepalive_tasks[session_id] = asyncio.create_task(
-                                            send_silence_keepalive(websocket, stream_sid, session_id, tts_service)
-                                        )
-                                        
-                                        # Map call to tenant id for later DB/Redis lookups (derive from Host header)
-                                        host_header = websocket.headers.get("host", "")
-                                        tenant_part = host_header.split(":")[0].split(".")[0].lower() if host_header else "default"
-                                        # Do not overwrite an existing tenant mapping established during the
-                                        # /voice webhook.  This prevents "stream" host from clobbering the
-                                        # real tenant (e.g. "clinicdev") and avoids downstream MCP lookup
-                                        # failures which halted OpenAI agent execution.
-                                        if call_sid not in self.call_to_tenant:
-                                            self.call_to_tenant[call_sid] = tenant_part or "default"
-                                            logger.debug("Mapped CallSid %s ➜ tenant '%s' (derived at WS connect)", call_sid, self.call_to_tenant[call_sid])
-                                        
-                                        # Exit the loop now that we have CallSid
-                                        break
                                     
-                                    # Also look for stream SID in case it contains the CallSid
-                                    elif stream_sid.startswith("CA"):
-                                        logger.info(f"✅ Extracted CallSid {stream_sid} from streamSid field")
-                                        call_sid = stream_sid
-                                        self.call_to_stream_sid[call_sid] = stream_sid
-                                        
-                                        # Create a unique session ID using call_sid
-                                        session_id = f"{call_sid}_{uuid.uuid4()}"
-                                        
-                                        # Update the active connections - replace placeholder with real session
-                                        self.active_connections[session_id] = websocket
-                                        logger.info(f"🔍 Proactively starting Deepgram connection for call: {call_sid}")
-                                        asyncio.create_task(self.deepgram_service.setup_connection(call_sid))
-                                        self.media_buffer[call_sid] = deque(maxlen=200)
-                                        try:
-                                            del self.active_connections[placeholder_id]
-                                        except KeyError:
-                                            pass
-                                        
-                                        # Cache MCP session ID for this call
-                                        tenant_id = self.call_to_tenant.get(call_sid)
-                                        await set_json(f"{tenant_id}:session:{call_sid}", session_id)
-                                        
-                                        # Generate and send welcome message immediately now that we have both Call SID and Stream SID
-                                        logger.info(f"Generating welcome message immediately for call {call_sid} with Stream SID {stream_sid}")
-                                        await tts_service.generate_welcome_message(call_sid, websocket, stream_sid)
-                                        
-                                        # Start the silence keep-alive task after welcome message completes
-                                        logger.info(f"Starting silence keep-alive after welcome message for call {call_sid}")
-                                        self.keepalive_tasks[session_id] = asyncio.create_task(
-                                            send_silence_keepalive(websocket, stream_sid, session_id, tts_service)
-                                        )
-                                        
-                                        # Map call to tenant id for later DB/Redis lookups (derive from Host header)
-                                        host_header = websocket.headers.get("host", "")
-                                        tenant_part = host_header.split(":")[0].split(".")[0].lower() if host_header else "default"
-                                        # Do not overwrite an existing tenant mapping established during the
-                                        # /voice webhook.  This prevents "stream" host from clobbering the
-                                        # real tenant (e.g. "clinicdev") and avoids downstream MCP lookup
-                                        # failures which halted OpenAI agent execution.
-                                        if call_sid not in self.call_to_tenant:
-                                            mapped = await tenant_map.get_tenant(call_sid)
-                                            if mapped:
-                                                self.call_to_tenant[call_sid] = mapped
-                                            else:
-                                                self.call_to_tenant[call_sid] = tenant_part or "default"
-                                            logger.debug("Mapped CallSid %s ➜ tenant '%s' (derived at WS connect)", call_sid, self.call_to_tenant[call_sid])
-                                            await tenant_map.set_tenant(call_sid, self.call_to_tenant[call_sid])
-                                        
-                                        # Exit the loop now that we have CallSid
-                                        break
-                                else:
-                                    logger.warning(f"⚠️ No Stream SID found in start event")
+                                    # Generate proper session ID now that we have CallSid
+                                    session_id = f"{call_sid}_{uuid.uuid4().hex[:8]}"
                                     
-                            elif event == "connected":
-                                logger.info(f"✅ Twilio WebSocket connection established for call: {call_sid}")
-                                
-                                # Note: Removing the welcome message queuing logic here
-                                # We'll send the welcome message directly when we get the "start" event
-                                logger.info(f"Waiting for Stream SID and Call SID before sending welcome message")
-                                
-                            elif event == "media":
-                                # Parse Twilio media event payload
-                                payload_b64 = data.get("media", {}).get("payload")
-                                if payload_b64:
-                                    pcm_ulaw = base64.b64decode(payload_b64)
-                                    # Feed frame into interruption detector before anything else
-                                    interruption_manager.process_frame(call_sid, pcm_ulaw)
-                                    count = self.media_frame_counts.get(session_id, 0) + 1
-                                    self.media_frame_counts[session_id] = count
-                                    await cancel_keepalive_if_needed(session_id, self.keepalive_tasks)
-                                    if pcm_ulaw:
-                                        if self.deepgram_service.connection_ready.get(call_sid):
-                                            await self._flush_media_buffer(call_sid)
-                                            success = await self.deepgram_service.send_audio(call_sid, pcm_ulaw)
-                                            if not success:
-                                                logger.warning(f"Failed to send audio to Deepgram for call {call_sid}")
-                                        else:
-                                            buf = self.media_buffer.get(call_sid)
-                                            if buf is not None:
-                                                buf.append(pcm_ulaw)
-                                                logger.debug(f"🔍 Deepgram not ready, buffering media frame {count} for call: {call_sid}")
-                                            else:
-                                                logger.debug(f"🔍 Media buffer not found (already flushed), dropping frame {count} for call: {call_sid}")
-                                else:
-                                    logger.debug(f"📦 No media payload for call {call_sid}")
-                                
-                            elif event == "stop":
-                                logger.info(f"Stream stop event received for call: {call_sid}")
-                                
-                                # Mark Deepgram call as closed to prevent reconnection
-                                self.deepgram_service.call_closed[call_sid] = True
-                                # Close Deepgram connection gracefully when the stream stops
-                                logger.info(f"Gracefully closing Deepgram connection due to stream stop for call: {call_sid}")
-                                await self.deepgram_service.close_connection(call_sid)
-                                logger.info(f"✅ Deepgram connection closed due to stream stop for call: {call_sid}")
-                                
-                                # Keep the WebSocket connection open for user interaction
-                                logger.info(f"Keeping WebSocket connection open for user interaction after stream stop for call: {call_sid}")
-                                
-                            elif event == "mark":
-                                # Handle Twilio mark events for speech detection
-                                mark_data = data.get("mark", {})
-                                mark_name = mark_data.get("name", "unknown")
-                                
-                                logger.info(f"📢 Mark event received for call {call_sid}: {mark_name}")
-                                logger.info(f"📢 Full mark event data: {json.dumps(data)}")
-                                
-                                # Different handling based on the mark name
-                                if "speech-start" in mark_name or "start-speech" in mark_name:
-                                    logger.info(f"🎤 Speech started for call {call_sid}")
-                                    # Ensure Deepgram connection is active when speech starts
-                                    await self.deepgram_service.setup_connection(call_sid)
-                                elif "speech-end" in mark_name or "end-speech" in mark_name:
-                                    logger.info(f"🎤 Speech ended for call {call_sid}")
-                                elif "no-speech" in mark_name:
-                                    logger.info(f"🔇 No speech detected for call {call_sid}")
-                                else:
-                                    # Log other mark events for debugging
-                                    logger.info(f"📢 Other mark event '{mark_name}' for call {call_sid}")
+                                    # Move from placeholder to proper session ID
+                                    del self.active_connections[placeholder_id]
+                                    self.active_connections[session_id] = websocket
                                     
-                                # Always update activity time for any mark event
-                                last_activity_time = datetime.now().timestamp()
-                                
+                                    # Initialize media buffer for this call
+                                    self.media_buffer[call_sid] = deque()
+                                    
+                                    # Record connection attempt with CallSid
+                                    pending_connection_attempt["call_sid"] = call_sid
+                                    pending_connection_attempt["session_id"] = session_id
+                                    pending_connection_attempt["status"] = "success"
+                                    self.websocket_connection_attempts.setdefault(call_sid, []).append(pending_connection_attempt)
+                                    
+                                    logger.info(f"✅ WebSocket connection established successfully. Call: {call_sid}, Session: {session_id}")
+                                    break
+                                else:
+                                    logger.warning("⚠️ No CallSid found in start event")
                             else:
-                                logger.info(f"🔍 Received unknown event type: {event} for call: {call_sid}")
-                                logger.info(f"🔍 Full event data: {json.dumps(data)}")
+                                logger.debug(f"📩 Event {event} received while waiting for start event")
                                 
                         except json.JSONDecodeError:
-                            logger.warning(f"Received non-JSON text message: {text_data}")
+                            logger.warning(f"⚠️ Received non-JSON text message while waiting for CallSid: {message['text']}")
+                            
+                except asyncio.TimeoutError:
+                    # Continue waiting for CallSid
+                    continue
                     
-                # Main message handling loop
-                logger.info(f"Successfully extracted CallSid {call_sid}, entering main WebSocket loop")
-                
-                # Ensure tenant history exists in Redis. Retrieve from in-memory
-                # mapping first, then cross-worker cache as a fallback.
-                tenant_id = self.call_to_tenant.get(call_sid, "default")
-                if tenant_id == "default":
-                    mapped = await tenant_map.get_tenant(call_sid)
-                    if mapped:
-                        tenant_id = mapped
-                        self.call_to_tenant[call_sid] = mapped
-
-                history_key = f"{tenant_id}:hist:{call_sid}"
+            # At this point we have CallSid, continue with normal processing
+            if not call_sid:
+                logger.error("❌ CallSid could not be extracted from start event")
+                await websocket.close(1008, "Invalid start event")
+                return
+            
+            # Now process calls with a known CallSid
+            
+            # Start Deepgram connection for this call
+            await self.deepgram_service.setup_connection(call_sid)
+            
+            # Start periodic ping task to keep connection alive
+            ping_task = asyncio.create_task(send_periodic_pings(websocket, call_sid))
+            logger.info(f"🏓 Ping task started for call: {call_sid}")
+            
+            # Handle conversation history initialization
+            if call_sid:
+                history_key = f"hist:{call_sid}"
                 existing_hist = await get_json(history_key)
                 if existing_hist is None:
                     await set_json(history_key, [])
@@ -547,13 +344,9 @@ class TwilioService:
                             # Re-raise if it's a different RuntimeError
                             raise re
                             
-            except Exception as e:
-                logger.error(f"❌ Error in main WebSocket loop for call {call_sid}: {str(e)}")
-                logger.error(traceback.format_exc())
-                
         except Exception as e:
-            # This will catch exceptions during connection acceptance
-            logger.error(f"❌ Failed to establish WebSocket connection: {str(e)}")
+            # This will catch exceptions during connection acceptance and main loop
+            logger.error(f"❌ Failed to establish WebSocket connection or error in main loop: {str(e)}")
             logger.error(traceback.format_exc())
             # Add connection failure to tracking
             pending_connection_attempt["status"] = "failed"
@@ -561,23 +354,9 @@ class TwilioService:
             pending_connection_attempt["traceback"] = traceback.format_exc()
             
         finally:
-            # Terminate MCP session on call end
-            if call_sid and session_id:
-                tenant_id = self.call_to_tenant.get(call_sid)
-                if tenant_id:
-                    base = os.environ.get("MCP_BASE", "https://mcp.pololabsai.com").rstrip("/")
-                    url = f"{base}/{tenant_id}/mcp"
-                    headers = {
-                        "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
-                        "Mcp-Session-Id": session_id,
-                    }
-                    try:
-                        async with httpx.AsyncClient() as client:
-                            await client.delete(url, headers=headers)
-                        logger.info(f"✓ MCP session {session_id} terminated for call {call_sid}")
-                    except Exception as e:
-                        logger.error(f"Error terminating MCP session {session_id} for call {call_sid}: {e}")
-
+            # Clean up resources - no MCP session termination needed with single-server architecture
+            # The MCP server handles session cleanup internally via the keep-alive and connection management
+            
             # Clean up
             if 'ping_task' in locals():
                 logger.info(f"🔍 Cancelling ping task for call: {call_sid if call_sid else 'unknown'}")
@@ -617,12 +396,6 @@ class TwilioService:
                 logger.info(f"🔍 Removing placeholder session from active connections: {placeholder_id}")
                 del self.active_connections[placeholder_id]
             
-            # Clean up conversation history
-            if call_sid:
-                # cleanup redis expiration left as-is; no explicit delete
-                if call_sid in self.call_to_tenant:
-                    del self.call_to_tenant[call_sid]
-            
             logger.info(f"WebSocket connection closed and cleaned up for call: {call_sid if call_sid else 'unknown'}")
             
     async def process_transcript(self, transcript: str, call_sid: str, is_final: bool):
@@ -635,12 +408,6 @@ class TwilioService:
             is_final: Whether this is a final transcript or interim
         """
         logger.debug(f"🔍 process_transcript invoked for call {call_sid}, is_final={is_final}: '{transcript}'")
-        tenant = self.call_to_tenant.get(call_sid, "default")
-        if tenant == "default":
-            mapped = await tenant_map.get_tenant(call_sid)
-            if mapped:
-                tenant = mapped
-                self.call_to_tenant[call_sid] = mapped
         
         # Drop non-final transcripts and skip response if agent cannot speak yet
         if not is_final:
@@ -651,8 +418,12 @@ class TwilioService:
         
         try:
             # Process with OpenAI agent
-            history_key = f"{tenant}:hist:{call_sid}"
-            conversation_history = await get_json(history_key) or []
+            history_key = f"hist:{call_sid}"
+            try:
+                conversation_history = await get_json(history_key) or []
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to load conversation history for call {call_sid}: {e}")
+                conversation_history = []  # Fallback to empty history
             
             # Identify session_id for MCP session header
             matching_sessions = [sid for sid in self.active_connections.keys() if sid.startswith(f"{call_sid}_")]
@@ -663,7 +434,7 @@ class TwilioService:
 
             # Process with agent via streaming (single LLM call) and capture cancellation handle
             history_future, delta_generator, llm_handle = await stream_agent_deltas(
-                transcript, conversation_history, tenant, session_id
+                transcript, conversation_history, session_id
             )
             # Register LLM streaming handle so it can be cancelled on barge-in
             interruption_manager.register_llm_handle(call_sid, llm_handle)
@@ -696,23 +467,28 @@ class TwilioService:
                 call_sid, delta_generator, websocket, stream_sid
             )
 
-            # Persist updated history once available (should be resolved
-            # at this point; if not, we await with a short timeout to
-            # avoid blocking indefinitely).
+            # Persist updated history once available (should be resolved now)
             try:
-                updated_history = await asyncio.wait_for(history_future, timeout=2.0)
-                await set_json(history_key, updated_history)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"History future did not resolve in time for call {call_sid}; using existing history."
-                )
-
-            # Clear handle registration once streaming completes
-            interruption_manager.register_llm_handle(call_sid, None)
+                conversation_history = await history_future
+                await set_json(history_key, conversation_history)
+            except CacheWriteError as e:
+                logger.warning(f"⚠️ Failed to persist conversation history for call {call_sid}: {e}")
+                # Continue without caching - the conversation can still work
+            except Exception as e:
+                logger.error(f"❌ Unexpected error persisting history for call {call_sid}: {e}")
             
+            # Start silence detection for potential keep-alive messages
+            try:
+                self.keepalive_tasks[session_id] = asyncio.create_task(
+                    send_silence_keepalive(websocket, stream_sid, session_id, tts_service)
+                )
+                logger.info(f"Started silence keep-alive for session: {session_id}")
+            except Exception as e:
+                logger.error(f"Failed to start silence keep-alive for session {session_id}: {e}")
+
         except Exception as e:
             logger.error(f"❌ Error processing transcript for call {call_sid}: {str(e)}")
             logger.error(traceback.format_exc())
 
-# Create a singleton instance
+# Create singleton instance
 twilio_service = TwilioService() 

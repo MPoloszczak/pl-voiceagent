@@ -1,19 +1,19 @@
 import os
 import uvicorn
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, Request, WebSocket, Response
 from aws_xray_sdk.core import patch_all
-from middlewares.tenant import TenantCtx
+import time
 
 from utils import logger, setup_logging
 from twilio import twilio_service
 from dpg import get_deepgram_service
 from ell import tts_service
+from oai import initialize_agent, cleanup_mcp_server
 
 patch_all()  # instrument std libs
 
 # Initialize FastAPI app
 app = FastAPI(title="Programmable Voice Agent")
-app.add_middleware(TenantCtx)
 
 # Create the singleton instance after all imports are resolved
 deepgram_service = get_deepgram_service()
@@ -27,10 +27,12 @@ async def startup_event():
     deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
     elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
     openai_api_key = os.getenv("OPENAI_API_KEY")
+    mcp_server_url = os.getenv("MCP_SERVER_URL")
     
     logger.info(f"DEEPGRAM_API_KEY found: {bool(deepgram_api_key)}")
     logger.info(f"ELEVENLABS_API_KEY found: {bool(elevenlabs_api_key)}")
     logger.info(f"OPENAI_API_KEY found: {bool(openai_api_key)}")
+    logger.info(f"MCP_SERVER_URL configured: {bool(mcp_server_url)} ({'default' if not mcp_server_url else 'custom'})")
     
     if not deepgram_api_key:
         logger.error("DEEPGRAM_API_KEY is missing. Deepgram transcription will not work.")
@@ -39,11 +41,26 @@ async def startup_event():
     if not openai_api_key:
         logger.error("OPENAI_API_KEY is missing. Agent responses will not work.")
     
+    # Initialize MCP agent with server connection
+    try:
+        await initialize_agent()
+        logger.info("✅ MCP agent initialization completed successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize MCP agent: {e}")
+        logger.warning("⚠️ Application will continue with basic agent functionality")
+    
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up resources on application shutdown."""
     logger.info("Shutting down Programmable Voice Agent service")
+    
+    # Clean up MCP server connection
+    try:
+        await cleanup_mcp_server()
+        logger.info("✅ MCP server cleanup completed")
+    except Exception as e:
+        logger.warning(f"⚠️ Error during MCP server cleanup: {e}")
     
     # Close all active Deepgram connections
     # We'll get the call SIDs from the active deepgram connections
