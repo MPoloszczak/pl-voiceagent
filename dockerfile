@@ -24,7 +24,7 @@ COPY . .
 # Set environment variables with defaults
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
-ENV PORT=8000
+ENV PORT=8080
 
 # Environment variables that must be configured at runtime:
 # - OPENAI_API_KEY: Required for OpenAI agent functionality
@@ -35,7 +35,7 @@ ENV PORT=8000
 # - Other optional environment variables documented in README
 
 # Expose the application port
-EXPOSE 8000
+EXPOSE 8080
 
 # Run the application
 CMD ["python", "main.py"] 
