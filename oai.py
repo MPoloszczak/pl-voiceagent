@@ -34,7 +34,7 @@ class HIPAALogger:
         )
 
 # Single MCP server configuration with client session management
-MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "https://mcp.pololabsai.com/mcp")
+MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "https://mcp.pololabsai.com/mcp/")
 MCP_PROTOCOL_VERSION = "2025-03-26"
 
 # Global client session tracking
