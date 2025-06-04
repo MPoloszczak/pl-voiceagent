@@ -155,18 +155,11 @@ async def create_mcp_server() -> Optional[object]:
                 "headers": session_headers,
                 "timeout": timedelta(seconds=15),
                 "sse_read_timeout": timedelta(seconds=30),
-                "follow_redirects": True,
-                "max_redirects": 3,
-                "keep_alive": True,  # Enable connection keep-alive
-                "pool_connections": 10,  # Connection pool size
-                "pool_maxsize": 20,  # Max pool size
-                "retry_attempts": 3,  # Retry failed requests
-                "backoff_factor": 0.3  # Exponential backoff for retries
+                "terminate_on_close": True
             },
             cache_tools_list=True,
             name="voice-agent-mcp",
-            client_session_timeout_seconds=30.0,
-            session_id=session_id  # Pass session ID to server
+            client_session_timeout_seconds=30.0
         )
         
         # Connect the server
