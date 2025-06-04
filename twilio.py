@@ -221,6 +221,18 @@ class TwilioService:
                                     self.websocket_connection_attempts.setdefault(call_sid, []).append(pending_connection_attempt)
                                     
                                     logger.info(f"✅ WebSocket connection established successfully. Call: {call_sid}, Session: {session_id}")
+                                    
+                                    # Ensure Stream SID is properly stored before breaking
+                                    if not stream_sid:
+                                        logger.warning(f"⚠️ No StreamSid found in start event for call {call_sid}, waiting for it...")
+                                        # Wait a small amount for potential subsequent events with StreamSid
+                                        await asyncio.sleep(0.1)
+                                        stream_sid = self.call_to_stream_sid.get(call_sid)
+                                        if stream_sid:
+                                            logger.info(f"✅ StreamSid found after wait: {stream_sid}")
+                                        else:
+                                            logger.error(f"❌ StreamSid still not available for call {call_sid}")
+                                    
                                     break
                                 else:
                                     logger.warning("⚠️ No CallSid found in start event")
@@ -244,6 +256,32 @@ class TwilioService:
             
             # Start Deepgram connection for this call
             await self.deepgram_service.setup_connection(call_sid)
+            
+            # Generate and send welcome message after Deepgram connection is ready
+            # HIPAA Compliance: §164.312(b) - Administrative safeguards for PHI communications
+            # Log welcome message generation for audit trail per §164.312(b)
+            logger.info(f"[HIPAA-AUDIT] welcome_message_generation initiated for call_sid={call_sid}")
+            try:
+                stream_sid = self.call_to_stream_sid.get(call_sid)
+                if not stream_sid:
+                    # Retry mechanism - wait a short time and check again
+                    logger.warning(f"⚠️ Stream SID not immediately available for call {call_sid}, retrying...")
+                    await asyncio.sleep(0.2)
+                    stream_sid = self.call_to_stream_sid.get(call_sid)
+                
+                if stream_sid:
+                    logger.info(f"🔊 Generating welcome message for call {call_sid} with stream {stream_sid}")
+                    await tts_service.generate_welcome_message(call_sid, websocket, stream_sid)
+                    # HIPAA Compliance: Log successful welcome message delivery per §164.312(b)
+                    logger.info(f"[HIPAA-AUDIT] welcome_message_delivered successfully for call_sid={call_sid}")
+                else:
+                    logger.error(f"❌ Cannot generate welcome message: No Stream SID found for call {call_sid} after retry")
+                    # HIPAA Compliance: Log failed welcome message for audit trail per §164.312(b)
+                    logger.error(f"[HIPAA-AUDIT] welcome_message_failed no_stream_sid for call_sid={call_sid}")
+            except Exception as e:
+                logger.error(f"❌ Error generating welcome message for call {call_sid}: {str(e)}")
+                # HIPAA Compliance: Log welcome message errors for audit trail per §164.312(b)
+                logger.error(f"[HIPAA-AUDIT] welcome_message_error for call_sid={call_sid}: {str(e)}")
             
             # Start periodic ping task to keep connection alive
             ping_task = asyncio.create_task(send_periodic_pings(websocket, call_sid))
