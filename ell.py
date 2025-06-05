@@ -8,6 +8,7 @@ import threading, queue, contextlib
 import time
 
 from elevenlabs.client import ElevenLabs
+from elevenlabs import VoiceSettings
 from starlette.websockets import WebSocketState, WebSocketDisconnect
 
 from utils import logger
@@ -260,20 +261,21 @@ class TTSService:
                             break
                         yield txt
                 try:
-                    # Fetch real voice settings for this voice
+                    # Create custom voice settings
                     voice_id = "ZF6FPAbjXT4488VcRRnw"
-                    try:
-                        voice_settings = eleven_client.voices.get_settings(voice_id)
-                    except Exception as vs_err:
-                        logger.error(f"❌ Failed to fetch voice settings for {voice_id}: {vs_err}")
-                        voice_settings = None
-                    # Stream with real voice settings and support early closure
+                    custom_voice_settings = VoiceSettings(
+                        stability=0.7,
+                        similarity_boost=0.9,
+                        style=0.1,
+                        use_speaker_boost=True
+                    )
+                    # Stream with custom voice settings and support early closure
                     audio_gen = eleven_client.text_to_speech.convert_realtime(
                             voice_id=voice_id,
                             text=_text_iter(),
                             model_id="eleven_flash_v2",
                             output_format="ulaw_8000",
-                            voice_settings=voice_settings
+                            voice_settings=custom_voice_settings
                     )
                     for audio_chunk in audio_gen:
                         if stop_event.is_set():
