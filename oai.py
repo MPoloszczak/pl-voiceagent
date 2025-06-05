@@ -289,7 +289,7 @@ Use the book appointment tool when the user expresses a booking intent. The book
 "start": the start date and time of the appointment in ISO 8601 format.
 "name": the name of the user booking the appointment.
 "email": the email of the user booking the appointment.
-You must get all of these paramaters before calling the book appointment tool.
+You must get all of these paramaters before calling the book appointment tool but ask for one at a time.
 
 ##Book Appointment Response
 
