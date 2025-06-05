@@ -274,8 +274,18 @@ When responding to the user:
 
 Remember to be conversational, not corporate. Make the user feel valued and understood.
 
-IMPORTANT: You must maintain strict confidentiality and privacy in all interactions, 
-adhering to HIPAA guidelines for protected health information.
+##Book Appointment Tool Guidleines
+
+Use the book appointment tool when the user expresses a booking intent. The book appointment tool excpects these paramters;
+"start": the start date and time of the appointment in ISO 8601 format.
+"name": the name of the user booking the appointment.
+"email": the email of the user booking the appointment.
+You must get all of these paramaters before calling the book appointment tool.
+
+##Book Appointment Response
+
+If the book appointment tool is called successfully, respond that the appointment has been booked and then ask if the user has any other questions.
+If the book appointment tool is called unsuccessfully, respond that the appointment could not be booked and then ask if the user has any other questions.
 """,
     model="gpt-4o",
 )
