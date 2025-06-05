@@ -11,6 +11,7 @@ import time
 from contextlib import asynccontextmanager
 import uuid
 import hashlib
+from datetime import datetime
 
 ##HIPAA Compliance & MCP Configuration--------------------------
 # HIPAA audit logging class
@@ -254,10 +255,15 @@ async def managed_session_context(session_id: str):
 # ------------------------------------------------------------------
 
 # Create agent with MCP server - will be configured at startup
+current_time = datetime.now().isoformat()
 medspa_agent = Agent(
     name="Medspa Agent",
-    instructions="""You are a friendly medspa assistant. Your role is to provide information about the medspa, answer questions, 
+    instructions=f"""You are a friendly medspa assistant. Your role is to provide information about the medspa, answer questions, 
 and build rapport with potential clients. 
+
+##Current Date and Time Context
+Current date and time: {current_time}
+Use this as your reference for the current date and time. Do not schedule any appointments before this date and time. Use the year as context for all scheduling discussions.
 
 Information about our medspa:
 - We offer a range of services including facials, botox, fillers, laser treatments, and skin consultations
