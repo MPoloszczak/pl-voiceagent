@@ -338,28 +338,20 @@ async def ensure_agent_initialized():
     
     # If MCP failed during startup and this is the first invocation, retry once
     if _mcp_retry_on_invocation and _mcp_initialization_attempted:
-        logger.info("[HIPAA-MCP] Retrying MCP server connection on first agent invocation")
-        HIPAALogger.log_mcp_access("mcp_retry_invocation", "started", "first_call_retry")
-        
+        logger.info("[HIPAA-MCP] Scheduling background MCP server reconnection")
+        HIPAALogger.log_mcp_access(
+            "mcp_retry_invocation",
+            "scheduled",
+            "background_retry",
+        )
+
         try:
-            mcp_server = await create_mcp_server()
-            if mcp_server:
-                _agent_with_mcp = Agent(
-                    name=medspa_agent.name,
-                    instructions=medspa_agent.instructions,
-                    model=medspa_agent.model,
-                    mcp_servers=[mcp_server]
-                )
-                logger.info("[HIPAA-MCP] ✅ MCP server connection successful on retry")
-                HIPAALogger.log_mcp_access("mcp_retry_invocation", "success", "connected_on_retry")
-            else:
-                logger.warning("[HIPAA-MCP] ⚠️ MCP server connection retry failed, continuing with fallback")
-                HIPAALogger.log_mcp_access("mcp_retry_invocation", "failed", "fallback_maintained")
+            asyncio.create_task(initialize_agent())
         except Exception as e:
-            logger.warning(f"[HIPAA-MCP] ⚠️ MCP server retry failed: {e}")
+            logger.warning("[HIPAA-MCP] Failed to schedule MCP reconnection task: %s", e)
             HIPAALogger.log_mcp_access("mcp_retry_invocation", "error", str(e))
-        
-        # Disable further retry attempts regardless of outcome
+
+        # Disable further retry attempts regardless of scheduling outcome
         _mcp_retry_on_invocation = False
 
 def get_agent() -> Agent:
