@@ -54,10 +54,12 @@ class InterruptionManager:
         self.tts_tasks = {}            # call_sid -> asyncio.Task
         self.llm_handles = {}          # call_sid -> handle with .cancel()
         self.speaking_flag = {}        # call_sid -> bool
+        self.silence_tasks = {}        # call_sid -> asyncio.Task
 
     def process_frame(self, call_sid, ulaw: bytes):
-        # only run VAD when the agent is speaking; otherwise ignore barge-in
-        if not self.speaking_flag.get(call_sid, False):
+        # only run VAD when the agent is speaking or waiting for user to finish
+        if not (self.speaking_flag.get(call_sid, False) or
+                self.awaiting_user_end.get(call_sid, False)):
             return
         det = self.detectors.get(call_sid)
         if not det:
@@ -69,12 +71,21 @@ class InterruptionManager:
             self._cancel_llm(call_sid)
             self.awaiting_user_end[call_sid] = True
             self.last_barge_in[call_sid] = time.time()
-            asyncio.create_task(self._wait_for_silence(call_sid))
+            existing = self.silence_tasks.get(call_sid)
+            if existing and not existing.done():
+                existing.cancel()
+            task = asyncio.create_task(self._wait_for_silence(call_sid))
+            self.silence_tasks[call_sid] = task
 
     async def _wait_for_silence(self, call_sid):
-        await asyncio.sleep(RESUME_SILENCE_MS / 1000)
-        if self.awaiting_user_end.get(call_sid):
-            self._clear_barge_in(call_sid)
+        while True:
+            await asyncio.sleep(RESUME_SILENCE_MS / 1000)
+            last = self.last_barge_in.get(call_sid, 0)
+            if time.time() - last >= RESUME_SILENCE_MS / 1000:
+                if self.awaiting_user_end.get(call_sid):
+                    self._clear_barge_in(call_sid)
+                break
+        self.silence_tasks.pop(call_sid, None)
 
     def _clear_barge_in(self, call_sid):
         self.awaiting_user_end.pop(call_sid, None)
@@ -131,6 +142,9 @@ class InterruptionManager:
         self.tts_tasks.pop(call_sid, None)
         self.llm_handles.pop(call_sid, None)
         self.speaking_flag.pop(call_sid, None)
+        task = self.silence_tasks.pop(call_sid, None)
+        if task and not task.done():
+            task.cancel()
 
 # Singleton instance for use in Twilio and TTS modules
 interruption_manager = InterruptionManager() 
