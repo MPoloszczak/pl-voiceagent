@@ -14,7 +14,12 @@ import os
 from utils import logger, TWIML_STREAM_TEMPLATE, send_periodic_pings, send_silence_keepalive, cancel_keepalive_if_needed
 from dpg import get_deepgram_service
 from ell import tts_service
-from oai import stream_agent_deltas
+from oai import (
+    stream_agent_deltas,
+    get_agent,
+    ensure_agent_initialized,
+    _warmup_llm,
+)
 from vad_events import interruption_manager
 from services.cache import get_json, set_json, CacheWriteError
 
@@ -282,6 +287,13 @@ class TwilioService:
                 logger.error(f"❌ Error generating welcome message for call {call_sid}: {str(e)}")
                 # HIPAA Compliance: Log welcome message errors for audit trail per §164.312(b)
                 logger.error(f"[HIPAA-AUDIT] welcome_message_error for call_sid={call_sid}: {str(e)}")
+
+            # Warm up the LLM in the background so the first user response is fast
+            try:
+                await ensure_agent_initialized()
+                asyncio.create_task(_warmup_llm(get_agent()))
+            except Exception as warm_err:
+                logger.debug(f"LLM warm-up scheduling failed: {warm_err}")
             
             # Start periodic ping task to keep connection alive
             ping_task = asyncio.create_task(send_periodic_pings(websocket, call_sid))
