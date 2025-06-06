@@ -22,6 +22,51 @@ class TTSService:
         self.api_key = os.getenv("ELEVENLABS_API_KEY")
         if not self.api_key:
             logger.error("❌ ELEVENLABS_API_KEY not found in environment variables")
+
+    async def warmup(self) -> None:
+        """Warm up ElevenLabs realtime TTS to avoid cold-start latency."""
+        if not self.api_key:
+            return
+
+        def _sync_warmup():
+            try:
+                client = ElevenLabs(api_key=self.api_key)
+                voice_id = "ZF6FPAbjXT4488VcRRnw"
+                settings = VoiceSettings(
+                    stability=0.7,
+                    similarity_boost=0.9,
+                    style=0.1,
+                    use_speaker_boost=True,
+                )
+
+                def _iter():
+                    yield "Hello"
+
+                gen = client.text_to_speech.convert_realtime(
+                    voice_id=voice_id,
+                    text=_iter(),
+                    model_id="eleven_flash_v2",
+                    output_format="ulaw_8000",
+                    voice_settings=settings,
+                )
+
+                try:
+                    next(gen, None)
+                finally:
+                    close = getattr(gen, "aclose", None)
+                    if close:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+            except Exception:
+                raise
+
+        try:
+            await asyncio.to_thread(_sync_warmup)
+            logger.info("[TTS] ElevenLabs warm-up completed")
+        except Exception as e:
+            logger.debug("[TTS] ElevenLabs warm-up failed: %s", e, exc_info=True)
         
     def generate_silence(self, duration_ms: int = 20) -> bytes:
         """
