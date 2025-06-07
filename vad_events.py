@@ -129,6 +129,8 @@ class InterruptionManager:
         if task and not task.done():
             task.cancel()
         self.tts_tasks.pop(call_sid, None)
+        # ensure speaking flag cleared immediately so further transcripts are processed
+        self.set_speaking(call_sid, False)
 
     # NEW: cancel any active LLM stream handle
     def _cancel_llm(self, call_sid):
