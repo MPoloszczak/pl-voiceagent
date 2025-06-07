@@ -333,10 +333,12 @@ async def initialize_agent():
         logger.info("[HIPAA-MCP] Agent initialized with MCP server, client_id=%s",
                    _session_manager.get_client_id())
         HIPAALogger.log_mcp_access("agent_initialization", "success", f"client_id={_session_manager.get_client_id()}")
+        await _warmup_llm(_agent_with_mcp)
     else:
         _agent_with_mcp = medspa_agent
         logger.warning("[HIPAA-MCP] Agent initialized without MCP server (fallback)")
         HIPAALogger.log_mcp_access("agent_initialization", "fallback_mode", "no_mcp_server")
+        await _warmup_llm(_agent_with_mcp)
 
 async def ensure_agent_initialized():
     """Ensure agent is initialized, with MCP retry on first invocation if needed."""
