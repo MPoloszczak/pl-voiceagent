@@ -305,7 +305,7 @@ _mcp_initialization_attempted: bool = False
 _mcp_retry_on_invocation: bool = True
 
 async def _warmup_llm(agent: Agent) -> None:
-    """Warm the LLM once during startup to avoid cold start latency."""
+    """Warm the LLM to avoid cold start latency."""
     try:
         await asyncio.wait_for(
             Runner.run(agent, [{"role": "user", "content": "Hello"}]),

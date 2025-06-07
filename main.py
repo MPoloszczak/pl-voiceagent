@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
         logger.info("🔄 Application will continue and retry MCP connection on first agent invocation")
         # HIPAA Compliance: Log startup failure for audit trail per §164.312(b)
         logger.info("[HIPAA-AUDIT] mcp_startup_failure logged for compliance tracking")
+
     
     yield
     

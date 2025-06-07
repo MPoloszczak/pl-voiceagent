@@ -288,12 +288,13 @@ class TwilioService:
                 # HIPAA Compliance: Log welcome message errors for audit trail per §164.312(b)
                 logger.error(f"[HIPAA-AUDIT] welcome_message_error for call_sid={call_sid}: {str(e)}")
 
-            # Warm up the LLM in the background so the first user response is fast
+            # Warm up LLM and TTS in the background so the first user response is fast
             try:
                 await ensure_agent_initialized()
                 asyncio.create_task(_warmup_llm(get_agent()))
+                asyncio.create_task(tts_service.warmup())
             except Exception as warm_err:
-                logger.debug(f"LLM warm-up scheduling failed: {warm_err}")
+                logger.debug(f"Warm-up scheduling failed: {warm_err}")
             
             # Start periodic ping task to keep connection alive
             ping_task = asyncio.create_task(send_periodic_pings(websocket, call_sid))
