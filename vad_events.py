@@ -55,6 +55,7 @@ class InterruptionManager:
         self.llm_handles = {}          # call_sid -> handle with .cancel()
         self.speaking_flag = {}        # call_sid -> bool
         self.silence_tasks = {}        # call_sid -> asyncio.Task
+        self.resume_callbacks = {}     # call_sid -> coroutine callback
 
     def process_frame(self, call_sid, ulaw: bytes):
         # only run VAD when the agent is speaking or waiting for user to finish
@@ -83,14 +84,20 @@ class InterruptionManager:
             last = self.last_barge_in.get(call_sid, 0)
             if time.time() - last >= RESUME_SILENCE_MS / 1000:
                 if self.awaiting_user_end.get(call_sid):
-                    self._clear_barge_in(call_sid)
+                    await self._clear_barge_in(call_sid)
                 break
         self.silence_tasks.pop(call_sid, None)
 
-    def _clear_barge_in(self, call_sid):
+    async def _clear_barge_in(self, call_sid):
         self.awaiting_user_end.pop(call_sid, None)
         self.last_barge_in.pop(call_sid, None)
         self.last_user_end[call_sid] = time.time()
+        callback = self.resume_callbacks.pop(call_sid, None)
+        if callback:
+            try:
+                await callback()
+            except Exception:
+                logger.exception("Error executing resume callback")
 
     def register_tts_task(self, call_sid, task):
         if task:
@@ -122,6 +129,8 @@ class InterruptionManager:
         if task and not task.done():
             task.cancel()
         self.tts_tasks.pop(call_sid, None)
+        # ensure speaking flag cleared immediately so further transcripts are processed
+        self.set_speaking(call_sid, False)
 
     # NEW: cancel any active LLM stream handle
     def _cancel_llm(self, call_sid):
@@ -133,6 +142,12 @@ class InterruptionManager:
                 pass
         self.llm_handles.pop(call_sid, None)
 
+    def register_resume_callback(self, call_sid, callback):
+        if callback:
+            self.resume_callbacks[call_sid] = callback
+        else:
+            self.resume_callbacks.pop(call_sid, None)
+
     def cleanup(self, call_sid):
         # Remove all call-specific data to avoid memory leaks
         self.detectors.pop(call_sid, None)
@@ -142,6 +157,7 @@ class InterruptionManager:
         self.tts_tasks.pop(call_sid, None)
         self.llm_handles.pop(call_sid, None)
         self.speaking_flag.pop(call_sid, None)
+        self.resume_callbacks.pop(call_sid, None)
         task = self.silence_tasks.pop(call_sid, None)
         if task and not task.done():
             task.cancel()
