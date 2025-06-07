@@ -304,6 +304,17 @@ _agent_with_mcp: Optional[Agent] = None
 _mcp_initialization_attempted: bool = False
 _mcp_retry_on_invocation: bool = True
 
+async def _warmup_llm(agent: Agent) -> None:
+    """Warm the LLM to avoid cold start latency."""
+    try:
+        await asyncio.wait_for(
+            Runner.run(agent, [{"role": "user", "content": "Hello"}]),
+            timeout=10.0,
+        )
+        logger.info("[LLM] Warm-up completed")
+    except Exception as e:
+        logger.debug("[LLM] Warm-up failed: %s", e, exc_info=True)
+
 async def initialize_agent():
     """Initialize the agent with MCP server connection."""
     global _agent_with_mcp, _mcp_initialization_attempted, _mcp_retry_on_invocation
@@ -319,7 +330,7 @@ async def initialize_agent():
             mcp_servers=[mcp_server]
         )
         _mcp_retry_on_invocation = False  # Success, no need to retry
-        logger.info("[HIPAA-MCP] Agent initialized with MCP server, client_id=%s", 
+        logger.info("[HIPAA-MCP] Agent initialized with MCP server, client_id=%s",
                    _session_manager.get_client_id())
         HIPAALogger.log_mcp_access("agent_initialization", "success", f"client_id={_session_manager.get_client_id()}")
     else:
