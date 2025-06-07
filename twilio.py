@@ -25,7 +25,7 @@ from oai import (
     get_agent,
     ensure_agent_initialized,
 )
-from vad_events import interruption_manager
+from vad_events import interruption_manager, HUMAN_GAP_SEC
 from services.cache import get_json, set_json, CacheWriteError
 
 
@@ -43,6 +43,11 @@ class TwilioService:
         self.media_frame_counts: Dict[str, int] = {}
         # Buffer for media frames before Deepgram connection is ready
         self.media_buffer: Dict[str, deque] = {}
+
+        # Buffer transcripts spoken during a barge-in event
+        self.barge_in_buffers: Dict[str, List[str]] = {}
+        # Track callbacks registered with the interruption manager
+        self.barge_in_registered: set[str] = set()
 
         # Get the deepgram service instance
         self.deepgram_service = get_deepgram_service()
@@ -64,6 +69,17 @@ class TwilioService:
             frame = buf.popleft()
             await self.deepgram_service.send_audio(call_sid, frame)
         del self.media_buffer[call_sid]
+
+    async def _process_barge_in_buffer(self, call_sid: str) -> None:
+        """Send any buffered user speech collected during a barge-in."""
+        transcripts = self.barge_in_buffers.pop(call_sid, [])
+        if not transcripts:
+            return
+        # ensure registration flag cleared
+        self.barge_in_registered.discard(call_sid)
+        await asyncio.sleep(HUMAN_GAP_SEC)
+        combined = " ".join(transcripts)
+        await self.process_transcript(combined, call_sid, True)
 
     async def handle_voice_webhook(self, request: Request) -> Response:
         """
@@ -544,6 +560,8 @@ class TwilioService:
                 self.deepgram_service.call_closed[call_sid] = True
                 # Cleanup interruption detector resources
                 interruption_manager.cleanup(call_sid)
+                self.barge_in_buffers.pop(call_sid, None)
+                self.barge_in_registered.discard(call_sid)
 
             # Close Deepgram connection
             if call_sid:
@@ -579,8 +597,17 @@ class TwilioService:
             f"🔍 process_transcript invoked for call {call_sid}, is_final={is_final}: '{transcript}'"
         )
 
-        # Drop non-final transcripts and skip response if agent cannot speak yet
+        # Ignore non-final transcripts
         if not is_final:
+            return
+        # If user is barging in, buffer transcript for later processing
+        if interruption_manager.awaiting_user_end.get(call_sid):
+            self.barge_in_buffers.setdefault(call_sid, []).append(transcript)
+            if call_sid not in self.barge_in_registered:
+                async def cb():
+                    await self._process_barge_in_buffer(call_sid)
+                interruption_manager.register_resume_callback(call_sid, cb)
+                self.barge_in_registered.add(call_sid)
             return
         if not interruption_manager.can_agent_speak(call_sid):
             logger.info(
