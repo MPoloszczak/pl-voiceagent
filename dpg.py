@@ -160,7 +160,7 @@ class DeepgramService:
                     interim_results=True,
                     punctuate=True,
                     endpointing=200,  # 200ms of silence to detect end of speech
-                    utterance_end_ms=400,  # 400ms of silence to mark utterance end
+                    utterance_end_ms=1000,  # 1 second of silence to mark utterance end
                     encoding="mulaw",
                     channels=1,
                     sample_rate=8000,  # Twilio uses 8kHz audio
