@@ -24,7 +24,6 @@ from oai import (
     stream_agent_deltas,
     get_agent,
     ensure_agent_initialized,
-    _warmup_llm,
 )
 from vad_events import interruption_manager
 from services.cache import get_json, set_json, CacheWriteError
@@ -346,14 +345,6 @@ class TwilioService:
                 logger.error(
                     f"[HIPAA-AUDIT] welcome_message_error for call_sid={call_sid}: {str(e)}"
                 )
-
-            # Warm up LLM and TTS in the background so the first user response is fast
-            try:
-                await ensure_agent_initialized()
-                asyncio.create_task(_warmup_llm(get_agent()))
-                asyncio.create_task(tts_service.warmup())
-            except Exception as warm_err:
-                logger.debug(f"Warm-up scheduling failed: {warm_err}")
 
             # Start periodic ping task to keep connection alive
             ping_task = asyncio.create_task(send_periodic_pings(websocket, call_sid))
