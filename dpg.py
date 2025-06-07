@@ -160,7 +160,7 @@ class DeepgramService:
                     interim_results=True,
                     punctuate=True,
                     endpointing=200,  # 200ms of silence to detect end of speech
-                    utterance_end_ms=1000,  # 1 second of silence to mark utterance end
+                    utterance_end_ms=400,  # 400ms of silence to mark utterance end
                     encoding="mulaw",
                     channels=1,
                     sample_rate=8000,  # Twilio uses 8kHz audio
@@ -226,7 +226,7 @@ class DeepgramService:
                 logger.info(f"✅ Sent silent audio packet to prime Deepgram connection for call: {call_sid}: {success}")
                 
                 # Wait longer to ensure connection is stable before continuing
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.05)
                 
                 # Verify the connection is fully ready with a test message
                 logger.info(f"Performing connection readiness verification for call: {call_sid}")
@@ -568,7 +568,7 @@ class DeepgramService:
                 return False
                 
             # Wait briefly to ensure message is processed
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.05)
             return connection.is_connected()
         except Exception as e:
             logger.error(f"❌ Error during connection validation test: {str(e)}")
