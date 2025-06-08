@@ -85,15 +85,19 @@ class TwilioService:
         await self.process_transcript(combined, call_sid, True)
 
     async def _process_skip_queue(self, call_sid: str) -> None:
-        """Replay any transcripts queued while the agent was speaking."""
-        transcripts = self.skip_queues.pop(call_sid, [])
-        self.skip_registered.discard(call_sid)
-        if not transcripts:
-            return
-        while not interruption_manager.can_agent_speak(call_sid):
-            await asyncio.sleep(0.05)
-        combined = " ".join(transcripts)
-        await self.process_transcript(combined, call_sid, True)
+
+        """Replay transcripts queued while the agent was speaking."""
+        try:
+            while True:
+                transcripts = self.skip_queues.pop(call_sid, [])
+                if not transcripts:
+                    break
+                while not interruption_manager.can_agent_speak(call_sid):
+                    await asyncio.sleep(0.05)
+                combined = " ".join(transcripts)
+                await self.process_transcript(combined, call_sid, True)
+        finally:
+            self.skip_registered.discard(call_sid)
 
     async def handle_voice_webhook(self, request: Request) -> Response:
         """
