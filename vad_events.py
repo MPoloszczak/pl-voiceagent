@@ -9,7 +9,9 @@ from utils import logger
 
 # Constants for VAD and turn-taking
 FRAME_MS = 20            # 20 ms frames
-CONSEC_VOICED_FRAMES = 2  # 40 ms of voiced frames to trigger barge-in
+# Require a bit more speech before triggering barge-in to avoid
+# spurious detections from brief noise or echo
+CONSEC_VOICED_FRAMES = 6  # 120 ms of voiced frames to trigger barge-in
 ENERGY_WINDOW = 8         # median over 8 frames (160 ms) for adaptive threshold
 NOISE_FLOOR = 300         # minimum RMS threshold
 RESUME_SILENCE_MS = 600    # wait 600 ms of silence before resuming agent
@@ -98,6 +100,13 @@ class InterruptionManager:
                 await callback()
             except Exception:
                 logger.exception("Error executing resume callback")
+
+    async def clear_barge_in_now(self, call_sid):
+        """Immediately clear any active barge-in state for the call."""
+        task = self.silence_tasks.pop(call_sid, None)
+        if task and not task.done():
+            task.cancel()
+        await self._clear_barge_in(call_sid)
 
     def register_tts_task(self, call_sid, task):
         if task:
