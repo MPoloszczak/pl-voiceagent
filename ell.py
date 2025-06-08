@@ -9,10 +9,25 @@ import time
 
 from elevenlabs.client import ElevenLabs
 from elevenlabs import VoiceSettings
+import elevenlabs.realtime_tts as rt
 from starlette.websockets import WebSocketState, WebSocketDisconnect
 
 from utils import logger
 from vad_events import interruption_manager
+
+
+def low_latency_text_chunker(chunks: Iterator[str]) -> Iterator[str]:
+    """Yield text chunks aggressively to reduce initial latency."""
+    splitters = (".", ",", "?", "!", ";", ":", "—", "-", "(", ")", "[", "]", "}", " ")
+    buffer = ""
+    for text in chunks:
+        buffer += text
+        # Emit chunk if buffer ends with punctuation or exceeds 20 chars
+        if len(buffer) >= 20 or buffer.endswith(splitters):
+            yield buffer if buffer.endswith(" ") else buffer + " "
+            buffer = ""
+    if buffer:
+        yield buffer if buffer.endswith(" ") else buffer + " "
 
 class TTSService:
     """Service for text-to-speech conversion using ElevenLabs"""
@@ -22,6 +37,13 @@ class TTSService:
         self.api_key = os.getenv("ELEVENLABS_API_KEY")
         if not self.api_key:
             logger.error("❌ ELEVENLABS_API_KEY not found in environment variables")
+            self.client: Optional[ElevenLabs] = None
+        else:
+            self.client = ElevenLabs(api_key=self.api_key)
+            try:
+                rt.text_chunker = low_latency_text_chunker
+            except Exception as e:
+                logger.warning(f"Failed to set low latency chunker: {e}")
 
     def generate_silence(self, duration_ms: int = 20) -> bytes:
         """
@@ -59,12 +81,11 @@ class TTSService:
             logger.info(f"🔍 Using Stream SID: '{stream_sid}' for welcome message")
             
             # Initialize ElevenLabs client
-            if not self.api_key:
+            if not self.client:
                 logger.error("❌ ELEVENLABS_API_KEY not found in environment variables")
                 return
-            
-            # Create the client
-            eleven_labs_client = ElevenLabs(api_key=self.api_key)
+
+            eleven_labs_client = self.client
             
             # Welcome message content
             welcome_message = "Hello, how can I help you today?"
@@ -203,11 +224,10 @@ class TTSService:
             if websocket.client_state == WebSocketState.DISCONNECTED:
                 logger.error(f"❌ PIPELINE ERROR: WebSocket disconnected before streaming for call {call_sid}")
                 return
-            if not self.api_key:
+            if not self.client:
                 logger.error("❌ PIPELINE ERROR: ELEVENLABS_API_KEY not found")
                 return
-            # Initialize ElevenLabs client
-            eleven_client = ElevenLabs(api_key=self.api_key)
+            eleven_client = self.client
             # Sync queues: text input via queue.Queue; audio output via asyncio.Queue
             text_queue = queue.Queue()
             audio_q = asyncio.Queue()
@@ -405,7 +425,5 @@ class TTSService:
             await _cleanup()
             interruption_manager.set_speaking(call_sid, False)
             interruption_manager.register_tts_task(call_sid, None)
-            interruption_manager.register_llm_handle(call_sid, None)
-
 # Create a singleton instance
-tts_service = TTSService() 
+tts_service = TTSService()
