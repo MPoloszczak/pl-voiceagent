@@ -608,6 +608,8 @@ class TwilioService:
                     await self._process_barge_in_buffer(call_sid)
                 interruption_manager.register_resume_callback(call_sid, cb)
                 self.barge_in_registered.add(call_sid)
+            # Clear barge-in immediately now that we have the user's utterance
+            await interruption_manager.clear_barge_in_now(call_sid)
             return
         if not interruption_manager.can_agent_speak(call_sid):
             logger.info(
