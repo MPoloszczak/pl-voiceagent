@@ -40,10 +40,12 @@ class TTSService:
             self.client: Optional[ElevenLabs] = None
         else:
             self.client = ElevenLabs(api_key=self.api_key)
+            
             try:
                 rt.text_chunker = low_latency_text_chunker
             except Exception as e:
                 logger.warning(f"Failed to set low latency chunker: {e}")
+
 
     def generate_silence(self, duration_ms: int = 20) -> bytes:
         """
