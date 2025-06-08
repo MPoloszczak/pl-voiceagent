@@ -85,6 +85,7 @@ class TwilioService:
         await self.process_transcript(combined, call_sid, True)
 
     async def _process_skip_queue(self, call_sid: str) -> None:
+
         """Replay transcripts queued while the agent was speaking."""
         try:
             while True:
