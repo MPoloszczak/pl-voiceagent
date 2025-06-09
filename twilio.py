@@ -88,15 +88,29 @@ class TwilioService:
         """Replay transcripts queued while the agent was speaking."""
         try:
             queue = self.skip_queues.get(call_sid, [])
+            resume_event = interruption_manager.get_resume_event(call_sid)
             while queue:
+                matching_sessions = [
+                    sid for sid in self.active_connections if sid.startswith(f"{call_sid}_")
+                ]
+                if call_sid not in [sid.split("_")[0] for sid in self.active_connections]:
+                    break
+                websocket = self.active_connections.get(matching_sessions[0]) if matching_sessions else None
+                if websocket is None or websocket.client_state == WebSocketState.DISCONNECTED:
+                    break
                 if not interruption_manager.can_agent_speak(call_sid):
-                    await asyncio.sleep(0.05)
+                    try:
+                        await asyncio.wait_for(resume_event.wait(), timeout=0.05)
+                    except asyncio.TimeoutError:
+                        pass
+                    resume_event.clear()
                     continue
                 transcript = queue.pop(0)
                 await self.process_transcript(transcript, call_sid, True)
             self.skip_queues.pop(call_sid, None)
         finally:
             self.skip_registered.discard(call_sid)
+            interruption_manager.resume_events.pop(call_sid, None)
 
     async def handle_voice_webhook(self, request: Request) -> Response:
         """

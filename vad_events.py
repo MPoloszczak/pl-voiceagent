@@ -60,6 +60,7 @@ class InterruptionManager:
         self.speaking_flag = {}        # call_sid -> bool
         self.silence_tasks = {}        # call_sid -> asyncio.Task
         self.resume_callbacks = {}     # call_sid -> coroutine callback
+        self.resume_events = {}        # call_sid -> asyncio.Event
 
     def process_frame(self, call_sid, ulaw: bytes):
         # only run VAD when the agent is speaking or waiting for user to finish
@@ -109,6 +110,9 @@ class InterruptionManager:
         if task and not task.done():
             task.cancel()
         await self._clear_barge_in(call_sid)
+        event = self.resume_events.get(call_sid)
+        if event:
+            event.set()
 
     def register_tts_task(self, call_sid, task):
         if task:
@@ -122,6 +126,13 @@ class InterruptionManager:
             self.llm_handles[call_sid] = handle
         else:
             self.llm_handles.pop(call_sid, None)
+
+    def get_resume_event(self, call_sid) -> asyncio.Event:
+        event = self.resume_events.get(call_sid)
+        if not event:
+            event = asyncio.Event()
+            self.resume_events[call_sid] = event
+        return event
 
     def set_speaking(self, call_sid, is_speaking: bool):
         # debug speaking flag changes
