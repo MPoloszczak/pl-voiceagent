@@ -48,6 +48,9 @@ class TwilioService:
         self.barge_in_buffers: Dict[str, List[str]] = {}
         # Track callbacks registered with the interruption manager
         self.barge_in_registered: set[str] = set()
+        # Temporary queue for transcripts skipped while agent is speaking
+        self.skip_queues: Dict[str, List[str]] = {}
+        self.skip_registered: set[str] = set()
 
         # Get the deepgram service instance
         self.deepgram_service = get_deepgram_service()
@@ -80,6 +83,20 @@ class TwilioService:
         await asyncio.sleep(HUMAN_GAP_SEC)
         combined = " ".join(transcripts)
         await self.process_transcript(combined, call_sid, True)
+
+    async def _process_skip_queue(self, call_sid: str) -> None:
+        """Replay transcripts queued while the agent was speaking."""
+        try:
+            queue = self.skip_queues.get(call_sid, [])
+            while queue:
+                if not interruption_manager.can_agent_speak(call_sid):
+                    await asyncio.sleep(0.05)
+                    continue
+                transcript = queue.pop(0)
+                await self.process_transcript(transcript, call_sid, True)
+            self.skip_queues.pop(call_sid, None)
+        finally:
+            self.skip_registered.discard(call_sid)
 
     async def handle_voice_webhook(self, request: Request) -> Response:
         """
@@ -562,6 +579,8 @@ class TwilioService:
                 interruption_manager.cleanup(call_sid)
                 self.barge_in_buffers.pop(call_sid, None)
                 self.barge_in_registered.discard(call_sid)
+                self.skip_queues.pop(call_sid, None)
+                self.skip_registered.discard(call_sid)
 
             # Close Deepgram connection
             if call_sid:
@@ -608,11 +627,17 @@ class TwilioService:
                     await self._process_barge_in_buffer(call_sid)
                 interruption_manager.register_resume_callback(call_sid, cb)
                 self.barge_in_registered.add(call_sid)
+            # Clear barge-in immediately now that we have the user's utterance
+            await interruption_manager.clear_barge_in_now(call_sid)
             return
         if not interruption_manager.can_agent_speak(call_sid):
             logger.info(
-                f"Skipping agent response for call {call_sid} due to pending barge-in or speaking flag"
+                f"Queuing transcript for call {call_sid} due to pending barge-in or speaking flag"
             )
+            self.skip_queues.setdefault(call_sid, []).append(transcript)
+            if call_sid not in self.skip_registered:
+                self.skip_registered.add(call_sid)
+                asyncio.create_task(self._process_skip_queue(call_sid))
             return
 
         try:
