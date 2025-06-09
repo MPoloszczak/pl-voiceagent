@@ -39,30 +39,6 @@ class TTSService:
         # μ-law silence using Twilio canonical digital 0xFF for μ-law
         return b'\xFF' * int(8000 * duration_ms / 1000)
 
-    async def warmup_realtime(self) -> None:
-        """Warm up ElevenLabs realtime TTS connection."""
-        if not self.client:
-            return
-
-        def _do_warmup():
-            try:
-                gen = self.client.text_to_speech.convert_realtime(
-                    voice_id="ZF6FPAbjXT4488VcRRnw",
-                    text=iter(["hi"]),
-                    model_id="eleven_flash_v2",
-                    output_format="ulaw_8000",
-                )
-                for _ in gen:
-                    pass
-            except Exception as exc:
-                raise exc
-
-        try:
-            await asyncio.get_running_loop().run_in_executor(None, _do_warmup)
-            logger.info("✅ ElevenLabs realtime TTS warm-up completed")
-        except Exception as e:
-            logger.warning(f"⚠️ ElevenLabs realtime warm-up failed: {e}")
-    
     async def generate_welcome_message(self, call_sid, websocket, stream_sid):
         """
         Generate a welcome message using ElevenLabs API and send it to the user.
@@ -90,15 +66,7 @@ class TTSService:
                 logger.error("❌ ELEVENLABS_API_KEY not found in environment variables")
                 return
 
-
             eleven_labs_client = self.client
-
-            # Warm up ElevenLabs realtime connection before generating audio
-            try:
-                await self.warmup_realtime()
-            except Exception:
-                # warmup_realtime already logs failures; proceed without raising
-                pass
             
             # Welcome message content
             welcome_message = "Hello, how can I help you today?"
