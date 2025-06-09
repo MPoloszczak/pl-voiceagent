@@ -8,17 +8,18 @@ from collections import deque
 from utils import logger
 
 # Constants for VAD and turn-taking
-FRAME_MS = 20            # 20 ms frames
+FRAME_MS = 20  # 20 ms frames
 # Require a bit more speech before triggering barge-in to avoid
 # spurious detections from brief noise or echo
 # 120 ms of voiced frames to trigger barge-in
 CONSEC_VOICED_FRAMES = 6  # 120 ms of voiced frames to trigger barge-in
 
-ENERGY_WINDOW = 8         # median over 8 frames (160 ms) for adaptive threshold
-NOISE_FLOOR = 300         # minimum RMS threshold
-RESUME_SILENCE_MS = 600    # wait 600 ms of silence before resuming agent
-HUMAN_GAP_SEC = 0.20       # additional 200 ms safety gap before speaking
+ENERGY_WINDOW = 8  # median over 8 frames (160 ms) for adaptive threshold
+NOISE_FLOOR = 300  # minimum RMS threshold
+RESUME_SILENCE_MS = 600  # wait 600 ms of silence before resuming agent
+HUMAN_GAP_SEC = 0.20  # additional 200 ms safety gap before speaking
 BARGE_IN_THROTTLE_SEC = 0.1  # throttle barge-in to once every 100 ms
+
 
 class InterruptionDetector:
     def __init__(self, call_sid):
@@ -49,23 +50,26 @@ class InterruptionDetector:
             self.voiced = 0
         return False
 
+
 class InterruptionManager:
     def __init__(self):
-        self.detectors = {}            # call_sid -> InterruptionDetector
-        self.awaiting_user_end = {}    # call_sid -> bool
-        self.last_barge_in = {}        # call_sid -> float
-        self.last_user_end = {}        # call_sid -> float
-        self.tts_tasks = {}            # call_sid -> asyncio.Task
-        self.llm_handles = {}          # call_sid -> handle with .cancel()
-        self.speaking_flag = {}        # call_sid -> bool
-        self.silence_tasks = {}        # call_sid -> asyncio.Task
-        self.resume_callbacks = {}     # call_sid -> coroutine callback
-        self.resume_events = {}        # call_sid -> asyncio.Event
+        self.detectors = {}  # call_sid -> InterruptionDetector
+        self.awaiting_user_end = {}  # call_sid -> bool
+        self.last_barge_in = {}  # call_sid -> float
+        self.last_user_end = {}  # call_sid -> float
+        self.tts_tasks = {}  # call_sid -> asyncio.Task
+        self.llm_handles = {}  # call_sid -> handle with .cancel()
+        self.speaking_flag = {}  # call_sid -> bool
+        self.silence_tasks = {}  # call_sid -> asyncio.Task
+        self.resume_callbacks = {}  # call_sid -> coroutine callback
+        self.resume_events = {}  # call_sid -> asyncio.Event
 
     def process_frame(self, call_sid, ulaw: bytes):
         # only run VAD when the agent is speaking or waiting for user to finish
-        if not (self.speaking_flag.get(call_sid, False) or
-                self.awaiting_user_end.get(call_sid, False)):
+        if not (
+            self.speaking_flag.get(call_sid, False)
+            or self.awaiting_user_end.get(call_sid, False)
+        ):
             return
         det = self.detectors.get(call_sid)
         if not det:
@@ -99,10 +103,14 @@ class InterruptionManager:
         self.last_user_end[call_sid] = time.time()
         callback = self.resume_callbacks.pop(call_sid, None)
         if callback:
-            try:
-                await callback()
-            except Exception:
-                logger.exception("Error executing resume callback")
+
+            async def run_callback():
+                try:
+                    await callback()
+                except Exception:
+                    logger.exception("Error executing resume callback")
+
+            asyncio.create_task(run_callback())
 
     async def clear_barge_in_now(self, call_sid):
         """Immediately clear any active barge-in state for the call."""
@@ -184,5 +192,6 @@ class InterruptionManager:
         if task and not task.done():
             task.cancel()
 
+
 # Singleton instance for use in Twilio and TTS modules
-interruption_manager = InterruptionManager() 
+interruption_manager = InterruptionManager()
