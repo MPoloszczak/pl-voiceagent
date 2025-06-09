@@ -11,8 +11,7 @@ from utils import logger
 FRAME_MS = 20            # 20 ms frames
 # Require a bit more speech before triggering barge-in to avoid
 # spurious detections from brief noise or echo
-
-=======
+# 120 ms of voiced frames to trigger barge-in
 CONSEC_VOICED_FRAMES = 6  # 120 ms of voiced frames to trigger barge-in
 
 ENERGY_WINDOW = 8         # median over 8 frames (160 ms) for adaptive threshold
