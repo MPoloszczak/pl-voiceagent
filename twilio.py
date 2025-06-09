@@ -375,6 +375,8 @@ class TwilioService:
                     await tts_service.generate_welcome_message(
                         call_sid, websocket, stream_sid
                     )
+                    # Pre-initialize the agent session while caller hears welcome
+                    asyncio.create_task(ensure_agent_initialized())
                     # HIPAA Compliance: Log successful welcome message delivery per §164.312(b)
                     logger.info(
                         f"[HIPAA-AUDIT] welcome_message_delivered successfully for call_sid={call_sid}"

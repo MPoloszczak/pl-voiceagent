@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI):
         # HIPAA Compliance: Log startup failure for audit trail per §164.312(b)
         logger.info("[HIPAA-AUDIT] mcp_startup_failure logged for compliance tracking")
 
+
     
     yield
     
