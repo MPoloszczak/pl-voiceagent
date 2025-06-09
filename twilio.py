@@ -52,6 +52,9 @@ class TwilioService:
         self.skip_queues: Dict[str, List[str]] = {}
         self.skip_registered: set[str] = set()
 
+        # Locks to serialize transcript processing per call
+        self.transcript_locks: Dict[str, asyncio.Lock] = {}
+
         # Get the deepgram service instance
         self.deepgram_service = get_deepgram_service()
 
@@ -581,6 +584,7 @@ class TwilioService:
                 self.barge_in_registered.discard(call_sid)
                 self.skip_queues.pop(call_sid, None)
                 self.skip_registered.discard(call_sid)
+                self.transcript_locks.pop(call_sid, None)
 
             # Close Deepgram connection
             if call_sid:
@@ -616,125 +620,126 @@ class TwilioService:
             f"🔍 process_transcript invoked for call {call_sid}, is_final={is_final}: '{transcript}'"
         )
 
-        # Ignore non-final transcripts
-        if not is_final:
-            return
-        # If user is barging in, buffer transcript for later processing
-        if interruption_manager.awaiting_user_end.get(call_sid):
-            self.barge_in_buffers.setdefault(call_sid, []).append(transcript)
-            if call_sid not in self.barge_in_registered:
-                async def cb():
-                    await self._process_barge_in_buffer(call_sid)
-                interruption_manager.register_resume_callback(call_sid, cb)
-                self.barge_in_registered.add(call_sid)
-            # Clear barge-in immediately now that we have the user's utterance
-            await interruption_manager.clear_barge_in_now(call_sid)
-            return
-        if not interruption_manager.can_agent_speak(call_sid):
-            logger.info(
-                f"Queuing transcript for call {call_sid} due to pending barge-in or speaking flag"
-            )
-            self.skip_queues.setdefault(call_sid, []).append(transcript)
-            if call_sid not in self.skip_registered:
-                self.skip_registered.add(call_sid)
-                asyncio.create_task(self._process_skip_queue(call_sid))
-            return
-
-        try:
-            # Process with OpenAI agent
-            history_key = f"hist:{call_sid}"
+        lock = self.transcript_locks.setdefault(call_sid, asyncio.Lock())
+        async with lock:
             try:
-                conversation_history = await get_json(history_key) or []
-            except Exception as e:
-                logger.warning(
-                    f"⚠️ Failed to load conversation history for call {call_sid}: {e}"
-                )
-                conversation_history = []  # Fallback to empty history
-
-            # Identify session_id for MCP session header
-            matching_sessions = [
-                sid
-                for sid in self.active_connections.keys()
-                if sid.startswith(f"{call_sid}_")
-            ]
-            if not matching_sessions:
-                logger.error(
-                    f"❌ No active WebSocket connection found for call {call_sid}"
-                )
-                return
-            session_id = matching_sessions[0]
-
-            # Process with agent via streaming (single LLM call) and capture cancellation handle
-            history_future, delta_generator, llm_handle = await stream_agent_deltas(
-                transcript, conversation_history, session_id
-            )
-            # Register LLM streaming handle so it can be cancelled on barge-in
-            interruption_manager.register_llm_handle(call_sid, llm_handle)
-
-            logger.info(f"⏩ PIPELINE: Streaming agent response for call {call_sid}")
-
-            # Retrieve websocket for this session
-            websocket = self.active_connections[session_id]
-
-            # Cancel silence keep-alive when sending an agent response
-            if session_id in self.keepalive_tasks:
-                logger.info(
-                    f"Cancelling silence keep-alive as agent is responding for session: {session_id}"
-                )
-                self.keepalive_tasks[session_id].cancel()
-                try:
-                    await self.keepalive_tasks[session_id]
-                except asyncio.CancelledError:
-                    pass
-                del self.keepalive_tasks[session_id]
-
-            # Get stream SID for this call
-            stream_sid = self.call_to_stream_sid.get(call_sid)
-            if not stream_sid:
-                logger.error(
-                    f"❌ No Stream SID found for call {call_sid}. Cannot send response."
-                )
-                return
-
-            # Stream the response with low-latency TTS – when this
-            # coroutine returns the delta generator has completed, so the
-            # history_future is now resolved.
-            await tts_service.stream_response_to_user(
-                call_sid, delta_generator, websocket, stream_sid
-            )
-
-            # Persist updated history once available (should be resolved now)
-            try:
-                conversation_history = await history_future
-                await set_json(history_key, conversation_history)
-            except CacheWriteError as e:
-                logger.warning(
-                    f"⚠️ Failed to persist conversation history for call {call_sid}: {e}"
-                )
-                # Continue without caching - the conversation can still work
-            except Exception as e:
-                logger.error(
-                    f"❌ Unexpected error persisting history for call {call_sid}: {e}"
-                )
-
-            # Start silence detection for potential keep-alive messages
-            try:
-                self.keepalive_tasks[session_id] = asyncio.create_task(
-                    send_silence_keepalive(
-                        websocket, stream_sid, session_id, tts_service
+                # Ignore non-final transcripts
+                if not is_final:
+                    return
+                # If user is barging in, buffer transcript for later processing
+                if interruption_manager.awaiting_user_end.get(call_sid):
+                    self.barge_in_buffers.setdefault(call_sid, []).append(transcript)
+                    if call_sid not in self.barge_in_registered:
+                        async def cb():
+                            await self._process_barge_in_buffer(call_sid)
+                        interruption_manager.register_resume_callback(call_sid, cb)
+                        self.barge_in_registered.add(call_sid)
+                    # Clear barge-in immediately now that we have the user's utterance
+                    await interruption_manager.clear_barge_in_now(call_sid)
+                    return
+                if not interruption_manager.can_agent_speak(call_sid):
+                    logger.info(
+                        f"Queuing transcript for call {call_sid} due to pending barge-in or speaking flag"
                     )
+                    self.skip_queues.setdefault(call_sid, []).append(transcript)
+                    if call_sid not in self.skip_registered:
+                        self.skip_registered.add(call_sid)
+                        asyncio.create_task(self._process_skip_queue(call_sid))
+                    return
+                # Process with OpenAI agent
+                history_key = f"hist:{call_sid}"
+                try:
+                    conversation_history = await get_json(history_key) or []
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ Failed to load conversation history for call {call_sid}: {e}"
+                    )
+                    conversation_history = []  # Fallback to empty history
+    
+                # Identify session_id for MCP session header
+                matching_sessions = [
+                    sid
+                    for sid in self.active_connections.keys()
+                    if sid.startswith(f"{call_sid}_")
+                ]
+                if not matching_sessions:
+                    logger.error(
+                        f"❌ No active WebSocket connection found for call {call_sid}"
+                    )
+                    return
+                session_id = matching_sessions[0]
+    
+                # Process with agent via streaming (single LLM call) and capture cancellation handle
+                history_future, delta_generator, llm_handle = await stream_agent_deltas(
+                    transcript, conversation_history, session_id
                 )
-                logger.info(f"Started silence keep-alive for session: {session_id}")
+                # Register LLM streaming handle so it can be cancelled on barge-in
+                interruption_manager.register_llm_handle(call_sid, llm_handle)
+    
+                logger.info(f"⏩ PIPELINE: Streaming agent response for call {call_sid}")
+    
+                # Retrieve websocket for this session
+                websocket = self.active_connections[session_id]
+    
+                # Cancel silence keep-alive when sending an agent response
+                if session_id in self.keepalive_tasks:
+                    logger.info(
+                        f"Cancelling silence keep-alive as agent is responding for session: {session_id}"
+                    )
+                    self.keepalive_tasks[session_id].cancel()
+                    try:
+                        await self.keepalive_tasks[session_id]
+                    except asyncio.CancelledError:
+                        pass
+                    del self.keepalive_tasks[session_id]
+    
+                # Get stream SID for this call
+                stream_sid = self.call_to_stream_sid.get(call_sid)
+                if not stream_sid:
+                    logger.error(
+                        f"❌ No Stream SID found for call {call_sid}. Cannot send response."
+                    )
+                    return
+    
+                # Stream the response with low-latency TTS – when this
+                # coroutine returns the delta generator has completed, so the
+                # history_future is now resolved.
+                await tts_service.stream_response_to_user(
+                    call_sid, delta_generator, websocket, stream_sid
+                )
+    
+                # Persist updated history once available (should be resolved now)
+                try:
+                    conversation_history = await history_future
+                    await set_json(history_key, conversation_history)
+                except CacheWriteError as e:
+                    logger.warning(
+                        f"⚠️ Failed to persist conversation history for call {call_sid}: {e}"
+                    )
+                    # Continue without caching - the conversation can still work
+                except Exception as e:
+                    logger.error(
+                        f"❌ Unexpected error persisting history for call {call_sid}: {e}"
+                    )
+    
+                # Start silence detection for potential keep-alive messages
+                try:
+                    self.keepalive_tasks[session_id] = asyncio.create_task(
+                        send_silence_keepalive(
+                            websocket, stream_sid, session_id, tts_service
+                        )
+                    )
+                    logger.info(f"Started silence keep-alive for session: {session_id}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to start silence keep-alive for session {session_id}: {e}"
+                    )
+
             except Exception as e:
                 logger.error(
-                    f"Failed to start silence keep-alive for session {session_id}: {e}"
+                    f"❌ Error processing transcript for call {call_sid}: {str(e)}"
                 )
-
-        except Exception as e:
-            logger.error(
-                f"❌ Error processing transcript for call {call_sid}: {str(e)}"
-            )
-            logger.error(traceback.format_exc())
+                logger.error(traceback.format_exc())
 
 
 # Create singleton instance
