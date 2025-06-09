@@ -51,6 +51,8 @@ class TwilioService:
         # Temporary queue for transcripts skipped while agent is speaking
         self.skip_queues: Dict[str, List[str]] = {}
         self.skip_registered: set[str] = set()
+        # Track tasks processing skipped transcripts
+        self.skip_queue_tasks: Dict[str, asyncio.Task] = {}
 
         # Get the deepgram service instance
         self.deepgram_service = get_deepgram_service()
@@ -581,6 +583,13 @@ class TwilioService:
                 self.barge_in_registered.discard(call_sid)
                 self.skip_queues.pop(call_sid, None)
                 self.skip_registered.discard(call_sid)
+                task = self.skip_queue_tasks.pop(call_sid, None)
+                if task:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
             # Close Deepgram connection
             if call_sid:
@@ -623,8 +632,10 @@ class TwilioService:
         if interruption_manager.awaiting_user_end.get(call_sid):
             self.barge_in_buffers.setdefault(call_sid, []).append(transcript)
             if call_sid not in self.barge_in_registered:
+
                 async def cb():
                     await self._process_barge_in_buffer(call_sid)
+
                 interruption_manager.register_resume_callback(call_sid, cb)
                 self.barge_in_registered.add(call_sid)
             # Clear barge-in immediately now that we have the user's utterance
@@ -637,7 +648,8 @@ class TwilioService:
             self.skip_queues.setdefault(call_sid, []).append(transcript)
             if call_sid not in self.skip_registered:
                 self.skip_registered.add(call_sid)
-                asyncio.create_task(self._process_skip_queue(call_sid))
+                task = asyncio.create_task(self._process_skip_queue(call_sid))
+                self.skip_queue_tasks[call_sid] = task
             return
 
         try:
