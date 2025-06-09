@@ -94,12 +94,23 @@ class TwilioService:
             resume_event = interruption_manager.get_resume_event(call_sid)
             while queue:
                 matching_sessions = [
-                    sid for sid in self.active_connections if sid.startswith(f"{call_sid}_")
+                    sid
+                    for sid in self.active_connections
+                    if sid.startswith(f"{call_sid}_")
                 ]
-                if call_sid not in [sid.split("_")[0] for sid in self.active_connections]:
+                if call_sid not in [
+                    sid.split("_")[0] for sid in self.active_connections
+                ]:
                     break
-                websocket = self.active_connections.get(matching_sessions[0]) if matching_sessions else None
-                if websocket is None or websocket.client_state == WebSocketState.DISCONNECTED:
+                websocket = (
+                    self.active_connections.get(matching_sessions[0])
+                    if matching_sessions
+                    else None
+                )
+                if (
+                    websocket is None
+                    or websocket.client_state == WebSocketState.DISCONNECTED
+                ):
                     break
                 if not interruption_manager.can_agent_speak(call_sid):
                     try:
@@ -646,8 +657,10 @@ class TwilioService:
                 if interruption_manager.awaiting_user_end.get(call_sid):
                     self.barge_in_buffers.setdefault(call_sid, []).append(transcript)
                     if call_sid not in self.barge_in_registered:
+
                         async def cb():
                             await self._process_barge_in_buffer(call_sid)
+
                         interruption_manager.register_resume_callback(call_sid, cb)
                         self.barge_in_registered.add(call_sid)
                     # Clear barge-in immediately now that we have the user's utterance
@@ -671,7 +684,7 @@ class TwilioService:
                         f"⚠️ Failed to load conversation history for call {call_sid}: {e}"
                     )
                     conversation_history = []  # Fallback to empty history
-    
+
                 # Identify session_id for MCP session header
                 matching_sessions = [
                     sid
@@ -684,19 +697,21 @@ class TwilioService:
                     )
                     return
                 session_id = matching_sessions[0]
-    
+
                 # Process with agent via streaming (single LLM call) and capture cancellation handle
                 history_future, delta_generator, llm_handle = await stream_agent_deltas(
                     transcript, conversation_history, session_id
                 )
                 # Register LLM streaming handle so it can be cancelled on barge-in
                 interruption_manager.register_llm_handle(call_sid, llm_handle)
-    
-                logger.info(f"⏩ PIPELINE: Streaming agent response for call {call_sid}")
-    
+
+                logger.info(
+                    f"⏩ PIPELINE: Streaming agent response for call {call_sid}"
+                )
+
                 # Retrieve websocket for this session
                 websocket = self.active_connections[session_id]
-    
+
                 # Cancel silence keep-alive when sending an agent response
                 if session_id in self.keepalive_tasks:
                     logger.info(
@@ -708,7 +723,7 @@ class TwilioService:
                     except asyncio.CancelledError:
                         pass
                     del self.keepalive_tasks[session_id]
-    
+
                 # Get stream SID for this call
                 stream_sid = self.call_to_stream_sid.get(call_sid)
                 if not stream_sid:
@@ -716,14 +731,14 @@ class TwilioService:
                         f"❌ No Stream SID found for call {call_sid}. Cannot send response."
                     )
                     return
-    
+
                 # Stream the response with low-latency TTS – when this
                 # coroutine returns the delta generator has completed, so the
                 # history_future is now resolved.
                 await tts_service.stream_response_to_user(
                     call_sid, delta_generator, websocket, stream_sid
                 )
-    
+
                 # Persist updated history once available (should be resolved now)
                 try:
                     conversation_history = await history_future
@@ -737,7 +752,7 @@ class TwilioService:
                     logger.error(
                         f"❌ Unexpected error persisting history for call {call_sid}: {e}"
                     )
-    
+
                 # Start silence detection for potential keep-alive messages
                 try:
                     self.keepalive_tasks[session_id] = asyncio.create_task(
