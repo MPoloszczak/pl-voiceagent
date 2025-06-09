@@ -11,7 +11,10 @@ from utils import logger
 FRAME_MS = 20            # 20 ms frames
 # Require a bit more speech before triggering barge-in to avoid
 # spurious detections from brief noise or echo
+
+=======
 CONSEC_VOICED_FRAMES = 6  # 120 ms of voiced frames to trigger barge-in
+
 ENERGY_WINDOW = 8         # median over 8 frames (160 ms) for adaptive threshold
 NOISE_FLOOR = 300         # minimum RMS threshold
 RESUME_SILENCE_MS = 600    # wait 600 ms of silence before resuming agent
