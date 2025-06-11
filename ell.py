@@ -270,6 +270,8 @@ class TTSService:
                         style=0.1,
                         use_speaker_boost=True
                     )
+                    # Track the first audio chunk streamed from ElevenLabs to mark start of audio delivery
+                    first_chunk_logged = False
                     # Stream with custom voice settings and support early closure
                     logger.info(f"DEBUG_TS TTS_CONVERT_REALTIME_CALL {call_sid} {time.time()}")
                     audio_gen = eleven_client.text_to_speech.convert_realtime(
@@ -280,6 +282,9 @@ class TTSService:
                             voice_settings=custom_voice_settings
                     )
                     for audio_chunk in audio_gen:
+                        if not first_chunk_logged:
+                            logger.info(f"DEBUG_TS TTS_STREAM_START {call_sid} {time.time()}")
+                            first_chunk_logged = True
                         if stop_event.is_set():
                             # close generator early
                             close_method = getattr(audio_gen, "aclose", None)
