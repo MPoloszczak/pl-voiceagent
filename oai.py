@@ -359,13 +359,7 @@ def get_agent() -> Agent:
     return _agent_with_mcp if _agent_with_mcp else medspa_agent
 
 _httpx_client = httpx.AsyncClient(
-    http2=True,
-    limits=httpx.Limits(
-        max_connections=5,            # allow a handful of concurrent requests
-        max_keepalive_connections=5,  # keep them warm for the entire call
-        keepalive_expiry=900.0        # 15 min – longer than any single phone call
-    ),
-    timeout=httpx.Timeout(10.0)        # generous connect timeout without blocking caller
+    http2=True
 )
 _oai_client: AsyncOpenAI = AsyncOpenAI(http_client=_httpx_client)
 
@@ -377,6 +371,7 @@ set_default_openai_client(_oai_client)
 # ------------------------------------------------------------------
 
 _openai_prewarmed: bool = False
+_agent_prewarmed: bool = False
 
 async def _prewarm_openai_connection() -> None:
     """Perform a lightweight, token-free request to establish TLS + HTTP/2.
@@ -418,6 +413,37 @@ async def _prewarm_openai_connection() -> None:
     except Exception as e:
         logger.warning("OpenAI warm-up failed on both endpoints: %s", e)
 
+    # ------------------------------------------------------------------
+    # 2️⃣ Warm up the Agents path by issuing a minimal streamed run and
+    #     aborting after the first delta so token usage stays tiny (~2-3).
+    # ------------------------------------------------------------------
+
+    global _agent_prewarmed
+    if _agent_prewarmed:
+        return
+
+    try:
+        dummy_input = [{"role": "user", "content": ""}]  # zero-content turn
+
+        # Obtain whichever Agent object is configured (with or without MCP)
+        agent_obj = get_agent()
+
+        streaming_result = Runner.run_streamed(agent_obj, dummy_input)
+
+        # Consume precisely one delta to trigger full backend path, then abort
+        async for event in streaming_result.stream_events():
+            if event.type == "raw_response_event":
+                break
+
+        # Attempt to close the generator/stream politely
+        close_method = getattr(streaming_result, "aclose", None)
+        if close_method:
+            await close_method()
+
+        _agent_prewarmed = True
+        logger.info("DEBUG_TS OPENAI_WARMUP_AGENT_OK %f", time.time())
+    except Exception as e:
+        logger.debug("Agent warm-up skipped/non-critical: %s", e)
 
 def schedule_openai_connection_warmup() -> None:
     """Schedule the warm-up coroutine on the running loop (fire-and-forget)."""
