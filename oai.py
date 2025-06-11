@@ -371,7 +371,6 @@ set_default_openai_client(_oai_client)
 # ------------------------------------------------------------------
 
 _openai_prewarmed: bool = False
-_agent_prewarmed: bool = False
 
 async def _prewarm_openai_connection() -> None:
     """Perform a lightweight, token-free request to establish TLS + HTTP/2.
@@ -413,38 +412,6 @@ async def _prewarm_openai_connection() -> None:
     except Exception as e:
         logger.warning("OpenAI warm-up failed on both endpoints: %s", e)
 
-    # ------------------------------------------------------------------
-    # 2️⃣ Warm up the Agents path by issuing a minimal streamed run and
-    #     aborting after the first delta so token usage stays tiny (~2-3).
-    # ------------------------------------------------------------------
-
-    global _agent_prewarmed
-    if _agent_prewarmed:
-        return
-
-    try:
-        dummy_input = [{"role": "user", "content": ""}]  # zero-content turn
-
-        # Obtain whichever Agent object is configured (with or without MCP)
-        agent_obj = get_agent()
-
-        streaming_result = Runner.run_streamed(agent_obj, dummy_input)
-
-        # Consume precisely one delta to trigger full backend path, then abort
-        async for event in streaming_result.stream_events():
-            if event.type == "raw_response_event":
-                break
-
-        # Attempt to close the generator/stream politely
-        close_method = getattr(streaming_result, "aclose", None)
-        if close_method:
-            await close_method()
-
-        _agent_prewarmed = True
-        logger.info("DEBUG_TS OPENAI_WARMUP_AGENT_OK %f", time.time())
-    except Exception as e:
-        logger.debug("Agent warm-up skipped/non-critical: %s", e)
-
 def schedule_openai_connection_warmup() -> None:
     """Schedule the warm-up coroutine on the running loop (fire-and-forget)."""
     if _openai_prewarmed:
@@ -455,6 +422,56 @@ def schedule_openai_connection_warmup() -> None:
     except RuntimeError:
         # No running loop (unlikely in FastAPI context) – run directly
         asyncio.run(_prewarm_openai_connection())
+
+# ------------------------------------------------------------------
+# Per-call Agent warm-up helpers – executed once per unique CallSid
+# ------------------------------------------------------------------
+
+_call_prewarm_registry: set[str] = set()
+
+
+async def _prewarm_agent_for_call(call_sid: str) -> None:
+    """Warm up the Agents tool-chain for a specific telephone call.
+
+    Sends an empty streamed request, consumes one delta and cancels the
+    stream.  Token cost is minimal (~3-4 prompt tokens).
+    """
+    if call_sid in _call_prewarm_registry:
+        return
+
+    try:
+        dummy_input = [{"role": "user", "content": ""}]
+        agent_obj = get_agent()
+
+        logger.info("DEBUG_TS OPENAI_WARMUP_AGENT_CALL_START %s %f", call_sid, time.time())
+
+        streaming_result = Runner.run_streamed(agent_obj, dummy_input)
+
+        async for event in streaming_result.stream_events():
+            if event.type == "raw_response_event":
+                break
+
+        # Close the stream politely
+        close = getattr(streaming_result, "aclose", None)
+        if close:
+            await close()
+
+        _call_prewarm_registry.add(call_sid)
+        logger.info("DEBUG_TS OPENAI_WARMUP_AGENT_CALL_OK %s %f", call_sid, time.time())
+    except Exception as e:
+        logger.debug("Agent warm-up for call %s failed: %s", call_sid, e)
+
+
+def schedule_agent_prewarm(call_sid: str) -> None:
+    """Fire-and-forget scheduling wrapper for call-level pre-warm."""
+    if call_sid in _call_prewarm_registry:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_prewarm_agent_for_call(call_sid))
+    except RuntimeError:
+        # rare path outside event-loop context
+        asyncio.run(_prewarm_agent_for_call(call_sid))
 
 # ---------------------------------------------------------------------------
 # Simplified Agent Response Functions with Session Management

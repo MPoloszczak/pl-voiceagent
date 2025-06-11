@@ -25,6 +25,7 @@ from oai import (
     get_agent,
     ensure_agent_initialized,
     schedule_openai_connection_warmup,
+    schedule_agent_prewarm,
 )
 from vad_events import interruption_manager, HUMAN_GAP_SEC
 from services.cache import get_json, set_json, CacheWriteError
@@ -154,6 +155,7 @@ class TwilioService:
         # This costs zero tokens and completes while the welcome prompt plays.
         try:
             schedule_openai_connection_warmup()
+            schedule_agent_prewarm(call_sid)
         except Exception as warm_err:
             logger.debug(f"Warm-up scheduling failed: {warm_err}")
 
