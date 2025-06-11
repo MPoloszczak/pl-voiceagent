@@ -271,6 +271,7 @@ class TTSService:
                         use_speaker_boost=True
                     )
                     # Stream with custom voice settings and support early closure
+                    logger.info(f"DEBUG_TS TTS_CONVERT_REALTIME_CALL {call_sid} {time.time()}")
                     audio_gen = eleven_client.text_to_speech.convert_realtime(
                             voice_id=voice_id,
                             text=_text_iter(),

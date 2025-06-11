@@ -426,12 +426,14 @@ async def get_agent_response(
         agent_input = call_conversation_history + [{"role": "user", "content": transcript}]
         
         try:
+            logger.info(f"DEBUG_TS RUNNER_RUN_START {tracked_session_id} {time.time()}")
             logger.info("[HIPAA] Executing agent run for session %s", tracked_session_id)
             result = await Runner.run(agent, agent_input)
             
             logger.info("[HIPAA] Agent run completed successfully for session %s", tracked_session_id)
             HIPAALogger.log_access(tracked_session_id, "agent_run", "success")
             
+            logger.info(f"DEBUG_TS RUNNER_RUN_END {tracked_session_id} {time.time()}")
             return result.to_input_list(), result.final_output
             
         except Exception as e:
@@ -466,6 +468,7 @@ async def stream_agent_deltas(
 
         async def _delta_generator():
             try:
+                logger.info(f"DEBUG_TS RUNNER_RUN_STREAMED_START {tracked_session_id} {time.time()}")
                 logger.info("[HIPAA] Starting streaming for session %s", tracked_session_id)
                 HIPAALogger.log_access(tracked_session_id, "streaming", "started")
                 
@@ -484,6 +487,7 @@ async def stream_agent_deltas(
                 logger.info("[HIPAA] Streaming completed successfully for session %s", tracked_session_id)
                 HIPAALogger.log_access(tracked_session_id, "streaming", "completed")
                 
+                logger.info(f"DEBUG_TS RUNNER_RUN_STREAMED_END {tracked_session_id} {time.time()}")
             except Exception as e:
                 logger.error("[HIPAA] Streaming error for session %s: %s", tracked_session_id, e)
                 HIPAALogger.log_access(tracked_session_id, "streaming", "error")

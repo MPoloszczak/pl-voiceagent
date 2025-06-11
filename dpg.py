@@ -752,6 +752,9 @@ class DeepgramService:
         if transcript.strip():
             if is_final:
                 logger.info(f"🎯 FINAL TRANSCRIPT: {transcript}")
+                logger.info(
+                    f"DEBUG_TS FINAL_TRANSCRIPT_RECEIVED {call_sid} {time.time()}"
+                )
                 if confidence is not None:
                     logger.info(f"🎯 Confidence: {confidence:.2f}")
             else:
