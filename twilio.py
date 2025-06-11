@@ -24,6 +24,7 @@ from oai import (
     stream_agent_deltas,
     get_agent,
     ensure_agent_initialized,
+    schedule_openai_connection_warmup,
 )
 from vad_events import interruption_manager, HUMAN_GAP_SEC
 from services.cache import get_json, set_json, CacheWriteError
@@ -147,6 +148,14 @@ class TwilioService:
             )
 
         logger.info(f"Incoming call received: {call_sid}")
+
+        # Fire-and-forget warm-up of the OpenAI connection so that the first
+        # agent response will not suffer a cold TLS/TCP handshake delay.
+        # This costs zero tokens and completes while the welcome prompt plays.
+        try:
+            schedule_openai_connection_warmup()
+        except Exception as warm_err:
+            logger.debug(f"Warm-up scheduling failed: {warm_err}")
 
         # Log additional Twilio parameters for debugging
         try:

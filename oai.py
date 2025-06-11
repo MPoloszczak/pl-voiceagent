@@ -358,49 +358,77 @@ def get_agent() -> Agent:
     """Get the configured agent (with or without MCP)."""
     return _agent_with_mcp if _agent_with_mcp else medspa_agent
 
-_httpx_client = httpx.AsyncClient()
+_httpx_client = httpx.AsyncClient(
+    http2=True,
+    limits=httpx.Limits(
+        max_connections=5,            # allow a handful of concurrent requests
+        max_keepalive_connections=5,  # keep them warm for the entire call
+        keepalive_expiry=900.0        # 15 min – longer than any single phone call
+    ),
+    timeout=httpx.Timeout(10.0)        # generous connect timeout without blocking caller
+)
 _oai_client: AsyncOpenAI = AsyncOpenAI(http_client=_httpx_client)
 
 # Register the client once for the entire process (thread-safe).
 set_default_openai_client(_oai_client)
 
-class StreamingHandle:
-    """Wrap an async generator to allow cancellation of the LLM stream."""
-    def __init__(self, agen):
-        self._agen = agen
-        self._cancelled = False
-        self._cleanup_task = None
-    
-    def cancel(self):
-        """Cancel the async generator to stop the LLM streaming."""
-        if self._cancelled:
+# ------------------------------------------------------------------
+# One-time connection warm-up for OpenAI – avoids first-turn latency
+# ------------------------------------------------------------------
+
+_openai_prewarmed: bool = False
+
+async def _prewarm_openai_connection() -> None:
+    """Perform a lightweight, token-free request to establish TLS + HTTP/2.
+
+    The call first tries the `/v1/audio/voices` endpoint (no token cost).
+    If that path is unavailable on the deployed API version it falls back
+    to `/v1/models`.  The response body is discarded immediately to keep
+    memory footprint minimal and avoid processing overhead.
+    """
+    global _openai_prewarmed
+    if _openai_prewarmed:
+        return
+
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}",
+        "User-Agent": "PoloLabs-VoiceAI/1.0-warmup",
+    }
+    try:
+        # 1️⃣ Attempt voices endpoint (preferred, zero-token)
+        resp = await _httpx_client.get(
+            "https://api.openai.com/v1/audio/voices", headers=headers
+        )
+        if resp.status_code == 200:
+            _openai_prewarmed = True
+            logger.info("DEBUG_TS OPENAI_WARMUP_VOICES_OK %f", time.time())
             return
-            
-        self._cancelled = True
-        
-        # Schedule cleanup asynchronously to avoid blocking and race conditions
-        try:
-            if hasattr(self._agen, 'aclose'):
-                try:
-                    loop = asyncio.get_running_loop()
-                    self._cleanup_task = loop.create_task(self._safe_cleanup())
-                except RuntimeError:
-                    logger.debug("Could not schedule async generator cleanup: event loop not available")
-        except Exception as e:
-            logger.debug("Error during streaming handle cancellation setup: %s", e)
-    
-    async def _safe_cleanup(self):
-        """Safely close the async generator with proper error handling."""
-        try:
-            if hasattr(self._agen, 'aclose'):
-                await self._agen.aclose()
-        except RuntimeError as e:
-            if "already running" in str(e):
-                logger.debug("Async generator cleanup skipped: generator still running")
-            else:
-                logger.debug("Async generator cleanup error: %s", e)
-        except Exception as e:
-            logger.debug("Unexpected error during async generator cleanup: %s", e)
+        logger.warning(
+            "OpenAI warm-up voices endpoint returned %s – falling back to /models",
+            resp.status_code,
+        )
+    except Exception as e:
+        logger.debug("Voices warm-up attempt failed: %s", e)
+
+    # 2️⃣ Fallback to models list (also free)
+    try:
+        await _oai_client.models.list()
+        _openai_prewarmed = True
+        logger.info("DEBUG_TS OPENAI_WARMUP_MODELS_OK %f", time.time())
+    except Exception as e:
+        logger.warning("OpenAI warm-up failed on both endpoints: %s", e)
+
+
+def schedule_openai_connection_warmup() -> None:
+    """Schedule the warm-up coroutine on the running loop (fire-and-forget)."""
+    if _openai_prewarmed:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_prewarm_openai_connection())
+    except RuntimeError:
+        # No running loop (unlikely in FastAPI context) – run directly
+        asyncio.run(_prewarm_openai_connection())
 
 # ---------------------------------------------------------------------------
 # Simplified Agent Response Functions with Session Management
@@ -510,3 +538,40 @@ async def stream_agent_deltas(
 
         agen = _delta_generator()
         return updated_hist_future, agen, StreamingHandle(agen)
+
+# ------------------------------------------------------------------
+# Helper class to manage cancellation of streamed LLM responses
+# ------------------------------------------------------------------
+
+class StreamingHandle:
+    """Wrap an async generator to allow safe cancellation of an LLM stream."""
+
+    def __init__(self, agen):
+        self._agen = agen
+        self._cancelled = False
+        self._cleanup_task: Optional[asyncio.Task] = None
+
+    def cancel(self):
+        """Cancel the async generator to stop the LLM streaming."""
+        if self._cancelled:
+            return
+        self._cancelled = True
+        try:
+            if hasattr(self._agen, "aclose"):
+                # Schedule cleanup without blocking
+                try:
+                    loop = asyncio.get_running_loop()
+                    self._cleanup_task = loop.create_task(self._safe_cleanup())
+                except RuntimeError:
+                    # Outside of running loop – execute synchronously
+                    asyncio.run(self._safe_cleanup())
+        except Exception as e:
+            logger.debug("StreamingHandle cancel setup failed: %s", e)
+
+    async def _safe_cleanup(self):
+        """Safely close the async generator with error handling."""
+        try:
+            if hasattr(self._agen, "aclose"):
+                await self._agen.aclose()
+        except Exception as e:
+            logger.debug("StreamingHandle cleanup error: %s", e)
