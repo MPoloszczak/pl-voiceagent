@@ -414,5 +414,102 @@ class TTSService:
             interruption_manager.register_tts_task(call_sid, None)
             interruption_manager.register_llm_handle(call_sid, None)
 
+    async def prompt_user_still_there(self, call_sid, websocket, stream_sid):
+        """
+        Prompt the caller when prolonged silence is detected.
+
+        This sends a short prompt – "Hello? Are you still there?" – via ElevenLabs
+        using the same voice/model/output settings as the welcome message. The
+        implementation intentionally mirrors `generate_welcome_message` to
+        minimise side-effects and ensure HIPAA-auditable parity in logging.
+        """
+        try:
+            # Mark agent as speaking so VAD is active during this prompt
+            interruption_manager.set_speaking(call_sid, True)
+            logger.info(f"🔊 Starting silence-prompt generation for call {call_sid}")
+
+            # Abort if WebSocket already closed
+            if websocket.client_state == WebSocketState.DISCONNECTED:
+                logger.error(
+                    f"❌ Cannot send silence prompt: WebSocket is disconnected for call {call_sid}"
+                )
+                return
+
+            if not self.client:
+                logger.error("❌ ELEVENLABS_API_KEY not found in environment variables")
+                return
+
+            prompt_text = "Hello? Are you still there?"
+            logger.info(f"🔊 Generating audio for silence prompt: '{prompt_text}'")
+
+            try:
+                audio_generator = self.client.text_to_speech.convert(
+                    voice_id="ZF6FPAbjXT4488VcRRnw",
+                    text=prompt_text,
+                    model_id="eleven_flash_v2",
+                    output_format="ulaw_8000",
+                )
+                # Collect audio bytes
+                audio_data = b"".join(audio_generator)
+                audio_data = self._strip_wav_header(audio_data)
+                logger.info(
+                    f"🔊 Silence prompt audio generated successfully, size: {len(audio_data)} bytes"
+                )
+            except Exception as tts_error:
+                logger.error(
+                    f"❌ Error generating silence prompt with ElevenLabs: {str(tts_error)}"
+                )
+                return
+
+            # Verify WebSocket still open before streaming
+            if websocket.client_state == WebSocketState.DISCONNECTED:
+                logger.error(
+                    f"❌ Cannot send silence prompt: WebSocket disconnected during audio generation for call {call_sid}"
+                )
+                return
+
+            # Send start mark for prompt
+            mark_msg = json.dumps(
+                {
+                    "event": "mark",
+                    "streamSid": stream_sid,
+                    "mark": {"name": "start-silence-prompt"},
+                }
+            )
+            await websocket.send_text(mark_msg)
+
+            # Stream in Twilio-safe chunks (≤3200 bytes ~400 ms)
+            max_chunk_size = 3200
+            buffer = audio_data
+            while buffer:
+                send_chunk = buffer[:max_chunk_size]
+                buffer = buffer[len(send_chunk) :]
+                media_msg = json.dumps(
+                    {
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {
+                            "payload": base64.b64encode(send_chunk).decode("utf-8")
+                        },
+                    }
+                )
+                await websocket.send_text(media_msg)
+                await asyncio.sleep(len(send_chunk) / 8000)  # pace to 8 kHz µ-law
+
+            # End mark
+            end_mark = json.dumps(
+                {
+                    "event": "mark",
+                    "streamSid": stream_sid,
+                    "mark": {"name": "end-silence-prompt"},
+                }
+            )
+            await websocket.send_text(end_mark)
+            logger.info(f"✅ Silence prompt completed for call {call_sid}")
+        except Exception as e:
+            logger.error(f"❌ Error in silence prompt for call {call_sid}: {e}")
+        finally:
+            interruption_manager.set_speaking(call_sid, False)
+
 # Create a singleton instance
 tts_service = TTSService() 

@@ -10,6 +10,7 @@ from starlette.websockets import WebSocketState
 import base64
 from collections import deque
 import os
+import time
 
 from utils import (
     logger,
@@ -62,6 +63,14 @@ class TwilioService:
 
         # Set transcript callback on deepgram service
         self.deepgram_service.set_transcript_callback(self.process_transcript)
+
+        # --- Silence watchdog state ---
+        # Track last time we heard the user speak (epoch seconds)
+        self.last_user_input: Dict[str, float] = {}
+        # Whether we have already prompted the caller for silence this round
+        self.silence_prompted: Dict[str, bool] = {}
+        # Background tasks per call for silence monitoring
+        self.silence_tasks: Dict[str, asyncio.Task] = {}
 
         logger.info("TwilioService initialized")
 
@@ -403,6 +412,13 @@ class TwilioService:
                     logger.info(
                         f"[HIPAA-AUDIT] welcome_message_delivered successfully for call_sid={call_sid}"
                     )
+
+                    # Initialise silence tracking after welcome is delivered
+                    self.last_user_input[call_sid] = time.time()
+                    silence_task = asyncio.create_task(
+                        self._monitor_user_silence(call_sid, websocket, stream_sid)
+                    )
+                    self.silence_tasks[call_sid] = silence_task
                 else:
                     logger.error(
                         f"❌ Cannot generate welcome message: No Stream SID found for call {call_sid} after retry"
@@ -641,6 +657,18 @@ class TwilioService:
                 )
                 del self.active_connections[placeholder_id]
 
+            # ---- Silence watchdog cleanup ----
+            if call_sid in self.silence_tasks:
+                logger.info(f"🔍 Cancelling silence watchdog for call: {call_sid}")
+                self.silence_tasks[call_sid].cancel()
+                try:
+                    await self.silence_tasks[call_sid]
+                except asyncio.CancelledError:
+                    pass
+                del self.silence_tasks[call_sid]
+                self.last_user_input.pop(call_sid, None)
+                self.silence_prompted.pop(call_sid, None)
+
             logger.info(
                 f"WebSocket connection closed and cleaned up for call: {call_sid if call_sid else 'unknown'}"
             )
@@ -664,6 +692,11 @@ class TwilioService:
                 # Ignore non-final transcripts
                 if not is_final:
                     return
+
+                # Record time of final user utterance to feed silence watchdog
+                self.last_user_input[call_sid] = time.time()
+                self.silence_prompted[call_sid] = False
+
                 # If user is barging in, buffer transcript for later processing
                 if interruption_manager.awaiting_user_end.get(call_sid):
                     self.barge_in_buffers.setdefault(call_sid, []).append(transcript)
@@ -782,6 +815,70 @@ class TwilioService:
                     f"❌ Error processing transcript for call {call_sid}: {str(e)}"
                 )
                 logger.error(traceback.format_exc())
+
+    # ---------------------------------------------------------------------
+    # Silence monitoring helpers
+    # ---------------------------------------------------------------------
+
+    async def _monitor_user_silence(self, call_sid: str, websocket: WebSocket, stream_sid: str):
+        """Watch for prolonged caller silence and act per business rules.
+
+        1. If 15 s elapse without caller input, prompt with TTS("Hello? …").
+        2. If another 15 s elapse (30 s total) without input, terminate call.
+        """
+
+        try:
+            while True:
+                await asyncio.sleep(1)
+                last_ts = self.last_user_input.get(call_sid)
+                if last_ts is None:
+                    # Call likely cleaned up
+                    return
+
+                elapsed = time.time() - last_ts
+
+                # First threshold – send prompt
+                if not self.silence_prompted.get(call_sid, False) and elapsed >= 15:
+                    logger.info(
+                        f"🔔 15 s silence detected on call {call_sid}; prompting caller"
+                    )
+                    # HIPAA Compliance: §164.312(b) – Log prompt for audit trail
+                    logger.info(
+                        f"[HIPAA-AUDIT] silence_prompt_issued call_sid={call_sid}"
+                    )
+                    try:
+                        await tts_service.prompt_user_still_there(
+                            call_sid, websocket, stream_sid
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"❌ Error sending silence prompt for call {call_sid}: {e}"
+                        )
+                    # Reset timer and set flag
+                    self.last_user_input[call_sid] = time.time()
+                    self.silence_prompted[call_sid] = True
+
+                # Second threshold – hang up
+                elif self.silence_prompted.get(call_sid, False) and elapsed >= 15:
+                    logger.warning(
+                        f"📞 Ending call {call_sid} due to 30 s of caller silence"
+                    )
+                    logger.debug(
+                        f"call ended due to user silence timeout (conversation watchdog)"
+                    )
+
+                    # Close Deepgram and WebSocket gracefully
+                    try:
+                        await self.deepgram_service.close_connection(call_sid)
+                    except Exception:
+                        pass
+
+                    if websocket.client_state != WebSocketState.DISCONNECTED:
+                        await websocket.close(code=1000, reason="User silence timeout")
+                    return
+        except asyncio.CancelledError:
+            # Task cancelled on normal cleanup
+            return
 
 
 # Create singleton instance
