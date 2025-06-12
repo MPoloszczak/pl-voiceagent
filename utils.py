@@ -155,7 +155,7 @@ async def cancel_keepalive_if_needed(session_id: str, keepalive_tasks: Dict[str,
         del keepalive_tasks[session_id] 
 
 #Change to 15 minutes, instead of 1 minute
-async def enforce_call_length_limit(call_sid: str, websocket, deepgram_service, duration_sec: int = 10):
+async def enforce_call_length_limit(call_sid: str, websocket, deepgram_service, duration_sec: int = 15 * 60):
     """Enforce a hard upper bound on the duration of a call.
 
     Once *duration_sec* seconds have elapsed, the call will be terminated
