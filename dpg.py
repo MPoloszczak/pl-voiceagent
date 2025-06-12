@@ -294,28 +294,33 @@ class DeepgramService:
                 logger.error(f"❌ Error cancelling Deepgram keep-alive task for call {call_sid}: {str(e)}")
                 logger.error(traceback.format_exc())
         
+        # Mark the call as intentionally closed to suppress reconnection attempts
+        self.call_closed[call_sid] = True
+
         # Close Deepgram connection if it exists
         if call_sid in self.active_connections:
             connection = self.active_connections[call_sid]
             try:
                 logger.debug(f"Closing Deepgram connection for call: {call_sid}")
-                
+
                 # The finish method returns a boolean directly, not a coroutine
                 finish_success = connection.finish()
                 if finish_success:
                     logger.info(f"✅ Deepgram connection successfully closed for call: {call_sid}")
                 else:
-                    logger.warning(f"⚠️ Deepgram connection may not have closed properly for call: {call_sid}")
-                
+                    logger.warning(
+                        f"⚠️ Deepgram connection may not have closed properly for call: {call_sid}"
+                    )
+
                 # Remove from active connections regardless of finish success
                 del self.active_connections[call_sid]
-                # Clean up readiness and closed flags
+                # Clean up readiness flag only; preserve call_closed so _on_close sees it
                 self.connection_ready.pop(call_sid, None)
-                self.call_closed.pop(call_sid, None)
             except Exception as e:
-                logger.error(f"❌ Error closing Deepgram connection for call {call_sid}: {str(e)}")
+                logger.error(
+                    f"❌ Error closing Deepgram connection for call {call_sid}: {str(e)}"
+                )
                 logger.error(traceback.format_exc())
-                
                 # Still remove from active connections on error to avoid stale references
                 try:
                     del self.active_connections[call_sid]

@@ -489,9 +489,10 @@ class TwilioService:
                                     # Mark Deepgram call as closed to prevent reconnection
                                     self.deepgram_service.call_closed[call_sid] = True
                                     # Close Deepgram connection gracefully
-                                    await self.deepgram_service.close_connection(
-                                        call_sid
-                                    )
+                                    try:
+                                        await self.deepgram_service.close_connection(call_sid)
+                                    except Exception:
+                                        pass
                                     logger.info(
                                         f"✅ Deepgram connection closed due to stream stop for call: {call_sid}"
                                     )
@@ -643,7 +644,12 @@ class TwilioService:
             # Close Deepgram connection
             if call_sid:
                 logger.info(f"🔍 Closing Deepgram connection for call: {call_sid}")
-                await self.deepgram_service.close_connection(call_sid)
+                try:
+                    # Mark as gracefully closed to prevent reconnection races
+                    self.deepgram_service.call_closed[call_sid] = True
+                    await self.deepgram_service.close_connection(call_sid)
+                except Exception:
+                    pass
 
             # Remove from active connections
             if session_id and session_id in self.active_connections:
@@ -869,6 +875,8 @@ class TwilioService:
 
                     # Close Deepgram and WebSocket gracefully
                     try:
+                        # Mark as gracefully closed to prevent reconnection races
+                        self.deepgram_service.call_closed[call_sid] = True
                         await self.deepgram_service.close_connection(call_sid)
                     except Exception:
                         pass
