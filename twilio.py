@@ -18,6 +18,7 @@ from utils import (
     send_periodic_pings,
     send_silence_keepalive,
     cancel_keepalive_if_needed,
+    enforce_call_length_limit,
 )
 from dpg import get_deepgram_service
 from ell import tts_service
@@ -71,6 +72,9 @@ class TwilioService:
         self.silence_prompted: Dict[str, bool] = {}
         # Background tasks per call for silence monitoring
         self.silence_tasks: Dict[str, asyncio.Task] = {}
+
+        # Background tasks per call for maximum call length enforcement
+        self.call_length_tasks: Dict[str, asyncio.Task] = {}
 
         logger.info("TwilioService initialized")
 
@@ -403,6 +407,19 @@ class TwilioService:
                     logger.info(
                         f"🔊 Generating welcome message for call {call_sid} with stream {stream_sid}"
                     )
+
+                    # -------------------------------------------------
+                    # Start maximum call length timer (15 minutes)
+                    # -------------------------------------------------
+                    length_task = asyncio.create_task(
+                        enforce_call_length_limit(
+                            call_sid,
+                            websocket,
+                            self.deepgram_service,
+                        )
+                    )
+                    self.call_length_tasks[call_sid] = length_task
+
                     await tts_service.generate_welcome_message(
                         call_sid, websocket, stream_sid
                     )
@@ -674,6 +691,16 @@ class TwilioService:
                 del self.silence_tasks[call_sid]
                 self.last_user_input.pop(call_sid, None)
                 self.silence_prompted.pop(call_sid, None)
+
+            # ---- Call length timer cleanup ----
+            if call_sid in self.call_length_tasks:
+                logger.info(f"🔍 Cancelling call length timer for call: {call_sid}")
+                self.call_length_tasks[call_sid].cancel()
+                try:
+                    await self.call_length_tasks[call_sid]
+                except asyncio.CancelledError:
+                    pass
+                del self.call_length_tasks[call_sid]
 
             logger.info(
                 f"WebSocket connection closed and cleaned up for call: {call_sid if call_sid else 'unknown'}"

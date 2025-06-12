@@ -153,3 +153,61 @@ async def cancel_keepalive_if_needed(session_id: str, keepalive_tasks: Dict[str,
         except asyncio.CancelledError:
             pass
         del keepalive_tasks[session_id] 
+        
+#Change to 15 minutes, instead of 1 minute
+async def enforce_call_length_limit(call_sid: str, websocket, deepgram_service, duration_sec: int = 1 * 60):
+    """Enforce a hard upper bound on the duration of a call.
+
+    Once *duration_sec* seconds have elapsed, the call will be terminated
+    gracefully – i.e. the Deepgram connection will be closed and the
+    WebSocket to Twilio will be closed if still open.
+
+    Args:
+        call_sid: The Twilio Call SID that uniquely identifies the call.
+        websocket: The WebSocket instance tied to the streaming call.
+        deepgram_service: An instance of the DeepgramService used by the
+            application – required so we can close the upstream ASR
+            connection in the same way other call-ending paths do.
+        duration_sec: Maximum allowed call length in seconds (default 15
+            minutes = 900 s).
+    """
+
+    # HIPAA Compliance: §164.312(b) – Maintain audit controls for
+    # electronic PHI. We log the timer start/stop events for traceability.
+    logger.info(f"[HIPAA-AUDIT] call_length_timer_started call_sid={call_sid} limit={duration_sec}s")
+
+    try:
+        await asyncio.sleep(duration_sec)
+
+        # If the coroutine is still running after *duration_sec* we have hit
+        # the upper bound. Proceed with graceful shutdown mirroring the
+        # silence-watchdog logic.
+        logger.debug(f"Call length timeout hit for {call_sid}")
+        logger.info(f"[HIPAA-AUDIT] call_length_timeout_reached call_sid={call_sid}")
+
+        # Mark the Deepgram connection as closed to avoid automatic
+        # reconnection attempts.
+        try:
+            deepgram_service.call_closed[call_sid] = True
+        except Exception:
+            # Deepgram service dict may not be initialised yet – fail soft.
+            pass
+
+        # Close Deepgram connection gracefully.
+        try:
+            await deepgram_service.close_connection(call_sid)
+        except Exception:
+            pass
+
+        # Close the WebSocket to Twilio if it is still open. Use the same
+        # status code employed elsewhere in the codebase for normal
+        # shutdown.
+        if websocket.client_state != WebSocketState.DISCONNECTED:
+            try:
+                await websocket.close(code=1000, reason="Maximum call duration reached")
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        # Normal cancellation (e.g. caller hung up before timeout).
+        logger.info(f"[HIPAA-AUDIT] call_length_timer_cancelled call_sid={call_sid}")
+        raise 
