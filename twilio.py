@@ -856,8 +856,8 @@ class TwilioService:
     async def _monitor_user_silence(self, call_sid: str, websocket: WebSocket, stream_sid: str):
         """Watch for prolonged caller silence and act per business rules.
 
-        1. If 15 s elapse without caller input, prompt with TTS("Hello? …").
-        2. If another 15 s elapse (30 s total) without input, terminate call.
+        1. If 30 s elapse without caller input, prompt with TTS("Hello? …").
+        2. If another 15 s elapse (45 s total) without input, terminate call.
         """
 
         try:
@@ -871,9 +871,9 @@ class TwilioService:
                 elapsed = time.time() - last_ts
 
                 # First threshold – send prompt
-                if not self.silence_prompted.get(call_sid, False) and elapsed >= 15:
+                if not self.silence_prompted.get(call_sid, False) and elapsed >= 30:
                     logger.info(
-                        f"🔔 15 s silence detected on call {call_sid}; prompting caller"
+                        f"🔔 30 s silence detected on call {call_sid}; prompting caller"
                     )
                     # HIPAA Compliance: §164.312(b) – Log prompt for audit trail
                     logger.info(
@@ -891,10 +891,10 @@ class TwilioService:
                     self.last_user_input[call_sid] = time.time()
                     self.silence_prompted[call_sid] = True
 
-                # Second threshold – hang up
+                # Second threshold – hang up (15 s after prompt)
                 elif self.silence_prompted.get(call_sid, False) and elapsed >= 15:
                     logger.warning(
-                        f"📞 Ending call {call_sid} due to 30 s of caller silence"
+                        f"📞 Ending call {call_sid} due to 45 s of caller silence"
                     )
                     logger.debug(
                         f"call ended due to user silence timeout (conversation watchdog)"
