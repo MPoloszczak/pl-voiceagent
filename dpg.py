@@ -727,19 +727,16 @@ class DeepgramService:
         
         # First check if this is a valid transcript response
         if not hasattr(transcript_event, 'channel'):
-            logger.warning(f"🎯 No channel found in transcript event for call {call_sid}")
-            logger.warning(f"🎯 Transcript event type: {type(transcript_event).__name__}")
-            logger.warning(f"🎯 Transcript event attributes: {dir(transcript_event)}")
-            logger.warning(f"🎯 Raw transcript event: {transcript_event}")
+            # HIPAA Compliance: Avoid logging raw transcript event details that may contain PHI.
+            logger.warning("🎯 No channel found in transcript event for call %s", call_sid)
             return
             
         if not hasattr(transcript_event.channel, 'alternatives'):
-            logger.warning(f"🎯 No alternatives found in transcript channel for call {call_sid}")
-            logger.warning(f"🎯 Channel attributes: {dir(transcript_event.channel)}")
+            logger.warning("🎯 No alternatives found in transcript channel for call %s", call_sid)
             return
             
         if not transcript_event.channel.alternatives:
-            logger.warning(f"🎯 Empty alternatives list in transcript for call {call_sid}")
+            logger.warning("🎯 Empty alternatives list in transcript for call %s", call_sid)
             return
         
         # Extract the transcript from the result
@@ -756,21 +753,17 @@ class DeepgramService:
         
         if transcript.strip():
             if is_final:
-                logger.info(f"🎯 FINAL TRANSCRIPT: {transcript}")
-                logger.info(
-                    f"DEBUG_TS FINAL_TRANSCRIPT_RECEIVED {call_sid} {time.time()}"
-                )
+                # HIPAA Compliance: Log only the length of the transcript to avoid PHI exposure
+                logger.info("🎯 FINAL transcript received (len=%d chars)", len(transcript))
+                logger.info("DEBUG_TS FINAL_TRANSCRIPT_RECEIVED %s %s", call_sid, time.time())
                 if confidence is not None:
-                    logger.info(f"🎯 Confidence: {confidence:.2f}")
+                    logger.info("🎯 Confidence: %.2f", confidence)
             else:
-                logger.info(f"🎯 PARTIAL TRANSCRIPT: {transcript}")
+                logger.info("🎯 PARTIAL transcript received (len=%d chars)", len(transcript))
                 if confidence is not None:
-                    logger.debug(f"🎯 Confidence: {confidence:.2f}")
+                    logger.debug("🎯 Confidence: %.2f", confidence)
         else:
-            logger.debug(f"🎯 Empty transcript received for call {call_sid} (is_final={is_final})")
-        
-        # Debug full transcript event at debug level
-        logger.debug(f"🎯 TRANSCRIPT FULL EVENT: {transcript_event}")
+            logger.debug("🎯 Empty transcript received for call %s (is_final=%s)", call_sid, is_final)
         
         # Use create_task to handle async processing without waiting
         if transcript_found and is_final and transcript.strip() and self.transcript_callback:

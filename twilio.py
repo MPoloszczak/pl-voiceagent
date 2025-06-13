@@ -175,11 +175,13 @@ class TwilioService:
         # Log additional Twilio parameters for debugging
         try:
             twilio_params = dict(form_data)
-            logger.info(
-                f"Twilio parameters for call {call_sid}: {json.dumps(twilio_params)}"
+            # HIPAA Compliance: redact fields that may contain PHI such as caller phone numbers.
+            sanitized_params = {k: v for k, v in twilio_params.items() if k.lower() not in ("caller", "from", "to", "callername")}
+            logger.debug(
+                f"Twilio parameters (sanitized) for call {call_sid}: {json.dumps(sanitized_params)}"
             )
         except Exception as e:
-            logger.warning(f"Could not log Twilio parameters: {str(e)}")
+            logger.debug(f"Could not log sanitized Twilio parameters: {str(e)}")
 
         # Generate WebSocket URL for Twilio streaming
         host = request.headers.get("host", "localhost:8080")
@@ -716,7 +718,7 @@ class TwilioService:
             is_final: Whether this is a final transcript or interim
         """
         logger.debug(
-            f"🔍 process_transcript invoked for call {call_sid}, is_final={is_final}: '{transcript}'"
+            f"🔍 process_transcript invoked for call {call_sid}, is_final={is_final}, transcript_len={len(transcript)}"
         )
 
         lock = self.transcript_locks.setdefault(call_sid, asyncio.Lock())
