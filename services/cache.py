@@ -1,6 +1,6 @@
 import os, json
 import redis.asyncio as redis
-from typing import Any
+from typing import Any, Optional
 from utils import logger
 from redis.exceptions import ConnectionError
 from redis.asyncio.cluster import RedisCluster
@@ -50,6 +50,22 @@ def _is_cluster_endpoint(url: str) -> bool:
 # occur at *import* time and can instead be handled gracefully at runtime.
 _redis_client = None  # will be set on first use
 
+# ---------------------------------------------------------------------------
+# Optional: AWS ElastiCache Auth Token handling
+# ---------------------------------------------------------------------------
+
+# HIPAA Compliance: Avoid logging raw auth token (PHI/PII)
+# The token is stored in environment variable REDIS_AUTH_TOKEN and will be
+# supplied as the password parameter when instantiating the Redis client.  We
+# never output this value to logs.
+
+_redis_auth_token: Optional[str] = os.environ.get("REDIS_AUTH_TOKEN")
+
+# When AWS Auth token is present, Redis typically expects the username to be
+# "default" (per AWS ElastiCache documentation).  If the token is not set we
+# leave both username and password as ``None`` so that any URL-embedded creds
+# remain untouched.
+_redis_username: Optional[str] = "default" if _redis_auth_token else None
 
 def _init_client() -> None:
     """Initialise the global ``_redis_client`` with cluster detection / TLS.
@@ -70,6 +86,8 @@ def _init_client() -> None:
                 decode_responses=True,
                 ssl=True,
                 ssl_cert_reqs=None,  # skip server cert validation – ensure SG/Private-Link enforcement instead
+                username=_redis_username,
+                password=_redis_auth_token,
             )
             logger.info("🔗 Initialised RedisCluster client (cluster endpoint detected)")
         else:
@@ -77,6 +95,8 @@ def _init_client() -> None:
                 redis_url,
                 decode_responses=True,
                 ssl_cert_reqs=None,
+                username=_redis_username,
+                password=_redis_auth_token,
             )
             logger.info("🔗 Initialised standalone Redis client")
     except Exception as e:  # broad but we must not crash import
