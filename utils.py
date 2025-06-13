@@ -211,3 +211,41 @@ async def enforce_call_length_limit(call_sid: str, websocket, deepgram_service, 
         # Normal cancellation (e.g. caller hung up before timeout).
         logger.info(f"[HIPAA-AUDIT] call_length_timer_cancelled call_sid={call_sid}")
         raise 
+
+# ---------------------------------------------------------------------------
+# Logging helpers – masking potential PHI / secrets
+# ---------------------------------------------------------------------------
+
+# Lower-cased header names that must be masked in any logs.  Includes common
+# authentication and identity fields that could contain PHI or credentials.
+_SENSITIVE_HEADER_KEYS = {
+    "authorization",
+    "x-twilio-signature",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "apikey",
+    "api_key",
+}
+
+
+def sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Return a copy of *headers* with sensitive values redacted.
+
+    A best-effort helper to avoid leaking authentication secrets or PHI in the
+    application logs.  Any header whose *name* matches one of the keys in
+    ``_SENSITIVE_HEADER_KEYS`` (case-insensitive) has its value replaced with
+    the literal string ``"REDACTED"``.
+
+    HIPAA §164.312(b) – Audit Controls: we keep structural information (the
+    presence of the header) for debugging/audit purposes while masking
+    contents that could identify an individual or disclose credentials.
+    """
+
+    sanitized: Dict[str, str] = {}
+    for k, v in headers.items():
+        if k.lower() in _SENSITIVE_HEADER_KEYS:
+            sanitized[k] = "REDACTED"
+        else:
+            sanitized[k] = v
+    return sanitized 

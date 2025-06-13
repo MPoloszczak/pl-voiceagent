@@ -61,12 +61,6 @@ _redis_client = None  # will be set on first use
 
 _redis_auth_token: Optional[str] = os.environ.get("REDIS_AUTH_TOKEN")
 
-# When AWS Auth token is present, Redis typically expects the username to be
-# "default" (per AWS ElastiCache documentation).  If the token is not set we
-# leave both username and password as ``None`` so that any URL-embedded creds
-# remain untouched.
-_redis_username: Optional[str] = "default" if _redis_auth_token else None
-
 def _init_client() -> None:
     """Initialise the global ``_redis_client`` with cluster detection / TLS.
 
@@ -86,7 +80,6 @@ def _init_client() -> None:
                 decode_responses=True,
                 ssl=True,
                 ssl_cert_reqs=None,  # skip server cert validation – ensure SG/Private-Link enforcement instead
-                username=_redis_username,
                 password=_redis_auth_token,
             )
             logger.info("🔗 Initialised RedisCluster client (cluster endpoint detected)")
@@ -94,8 +87,7 @@ def _init_client() -> None:
             _redis_client = redis.from_url(
                 redis_url,
                 decode_responses=True,
-                ssl_cert_reqs=None,
-                username=_redis_username,
+                ssl_cert_reqs=None,                
                 password=_redis_auth_token,
             )
             logger.info("🔗 Initialised standalone Redis client")

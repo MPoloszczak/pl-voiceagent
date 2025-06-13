@@ -19,6 +19,7 @@ from utils import (
     send_silence_keepalive,
     cancel_keepalive_if_needed,
     enforce_call_length_limit,
+    sanitize_headers,
 )
 from dpg import get_deepgram_service
 from ell import tts_service
@@ -187,7 +188,8 @@ class TwilioService:
         host = request.headers.get("host", "localhost:8080")
         scheme = request.headers.get("x-forwarded-proto", "http")
 
-        logger.info(f"🔍 Request headers: {dict(request.headers)}")
+        safe_headers = sanitize_headers(dict(request.headers))
+        logger.info(f"🔍 Request headers: {safe_headers}")
         logger.info(f"🔍 Detected host: {host}, scheme: {scheme}")
 
         websocket_url = f"wss://{host}/twilio-stream"
@@ -217,7 +219,7 @@ class TwilioService:
         """
         # Enhanced logging for incoming connection request
         connection_request_details = {
-            "headers": dict(websocket.headers),
+            "headers": sanitize_headers(dict(websocket.headers)),
             "path": websocket.url.path,
             "query_params": dict(websocket.query_params),
             "raw_path": str(websocket.url),
@@ -239,7 +241,7 @@ class TwilioService:
         callsid_start_time = datetime.now().timestamp()
 
         # Enhanced connection logging
-        headers = dict(websocket.headers)
+        headers = sanitize_headers(dict(websocket.headers))
         logger.info(f"🔍 WebSocket connection request received, awaiting CallSid")
         logger.info(f"🔍 WebSocket request headers: {json.dumps(headers)}")
         logger.info(f"🔍 WebSocket connection path: {websocket.url.path}")
