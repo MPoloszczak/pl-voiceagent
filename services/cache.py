@@ -9,8 +9,10 @@ from urllib.parse import urlparse
 # ---------------------------------------------------------------------------
 # Local ElastiCache IAM credential provider (avoids redis-py 5.4 dependency)
 # ---------------------------------------------------------------------------
-# redis-py <6.0 does not yet bundle IAMCredentialsProvider.  Until it ships we
-# embed a minimal provider that generates SigV4 tokens using botocore.
+# Modern redis-py (≥5.3) ships an official ``CredentialProvider`` interface that we
+# subclass for ElastiCache IAM auth.  The legacy import shim has been removed to
+# simplify the codebase and follow upstream best-practice – see
+# https://redis.readthedocs.io/en/stable/examples/connection_examples.html#Connecting-to-a-redis-instance-with-ElastiCache-IAM-credential-provider
 #
 # HIPAA §164.312(e)(1) – we always sign via HTTPS and enforce TLS when the
 # client connects below.
@@ -19,11 +21,7 @@ from botocore.model import ServiceId  # type: ignore
 from botocore.signers import RequestSigner  # type: ignore
 import botocore.session  # type: ignore
 
-# Redis defines an abstract CredentialProvider base – import defensively.
-try:
-    from redis.credentials import CredentialProvider as _BaseCredProvider  # type: ignore
-except ImportError:  # redis 5.0 fallback name
-    from redis import CredentialProvider as _BaseCredProvider  # type: ignore
+from redis.credentials import CredentialProvider as _BaseCredProvider  # type: ignore
 
 
 class _ElastiCacheIAMProvider(_BaseCredProvider):
