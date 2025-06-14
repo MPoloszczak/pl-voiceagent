@@ -49,6 +49,8 @@ logger.info("Logger initialized")
 # place.
 # -----------------------------------------------------------------------------
 
+_SECRETS_LOADED = False  # module-level guard
+
 def _load_secrets_from_aws() -> None:
     """Populate os.environ from a JSON secret if ENV_VARS_ARN is set.
 
@@ -58,6 +60,9 @@ def _load_secrets_from_aws() -> None:
     local development).  Any failure is logged but does *not* raise so the app
     can still start with whatever configuration is available.
     """
+    global _SECRETS_LOADED
+    if _SECRETS_LOADED:
+        return
     secret_arn = os.getenv("ENV_VARS_ARN")
     if not secret_arn:
         return  # nothing to do
@@ -84,6 +89,7 @@ def _load_secrets_from_aws() -> None:
                 os.environ[key] = str(value)
                 injected += 1
         logger.info("🔐 Loaded %d secrets from Secrets Manager", injected)
+        _SECRETS_LOADED = True
     except Exception as e:  # broad catch to avoid startup failure
         logger.error("❌ Failed to load application secrets from %s: %s", secret_arn, e)
 
