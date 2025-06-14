@@ -8,6 +8,7 @@ from starlette.websockets import WebSocketState
 import base64
 from typing import Dict
 import sys
+import boto3
 
 # Configure logging
 def setup_logging(app_name="pl-voiceagent"):
@@ -40,6 +41,55 @@ def setup_logging(app_name="pl-voiceagent"):
 # Initialize logger
 logger = setup_logging()
 logger.info("Logger initialized")
+
+# -----------------------------------------------------------------------------
+# Centralised secret loading – fetch JSON blob from a single Secrets Manager ARN
+# and project each key/value into os.environ. This lets the application continue
+# to use simple os.getenv look-ups while keeping all sensitive config in one
+# place.
+# -----------------------------------------------------------------------------
+
+def _load_secrets_from_aws() -> None:
+    """Populate os.environ from a JSON secret if ENV_VARS_ARN is set.
+
+    The secret is expected to contain a JSON object where each top-level key
+    corresponds to one environment variable needed by the application.
+    Existing os.environ keys are left untouched to allow overrides (e.g. for
+    local development).  Any failure is logged but does *not* raise so the app
+    can still start with whatever configuration is available.
+    """
+    secret_arn = os.getenv("ENV_VARS_ARN")
+    if not secret_arn:
+        return  # nothing to do
+
+    try:
+        # Use default credentials/region resolution chain – override region for
+        # local dev when AWS_REGION is not set.
+        sm = boto3.client("secretsmanager", region_name=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1")
+        response = sm.get_secret_value(SecretId=secret_arn)
+        secret_string = response.get("SecretString")
+        if not secret_string:
+            logger.error("Secrets Manager returned no SecretString for %s", secret_arn)
+            return
+
+        try:
+            secrets = json.loads(secret_string)
+        except json.JSONDecodeError:
+            logger.error("Secret %s is not valid JSON – skipping automatic injection", secret_arn)
+            return
+
+        injected = 0
+        for key, value in secrets.items():
+            if key not in os.environ:
+                os.environ[key] = str(value)
+                injected += 1
+        logger.info("🔐 Loaded %d secrets from Secrets Manager", injected)
+    except Exception as e:  # broad catch to avoid startup failure
+        logger.error("❌ Failed to load application secrets from %s: %s", secret_arn, e)
+
+
+# Invoke at import time so that any later module import sees populated env vars
+_load_secrets_from_aws()
 
 async def send_periodic_pings(websocket, session_id, interval=25):
     """
