@@ -2,7 +2,7 @@ import os, json
 import redis.asyncio as redis
 from typing import Any, Optional
 from utils import logger
-from redis.exceptions import ConnectionError
+from redis.exceptions import ConnectionError, AuthenticationError
 from redis.asyncio.cluster import RedisCluster
 from urllib.parse import urlparse
 
@@ -204,6 +204,13 @@ def _init_client() -> None:
                 **auth_kwargs,
             )
             logger.info("🔗 Initialised standalone Redis client using IAM authentication")
+    except AuthenticationError as ae:
+        logger.error(
+            "🛂 Redis authentication failed for IAM user '%s': %s. Check that the ElastiCache user exists, is enabled, and is configured for IAM authentication.",
+            _redis_iam_user or "<unset>",
+            ae,
+        )
+        _redis_client = None
     except Exception as e:  # broad but we must not crash import
         logger.error(f"❌ Failed to initialise Redis client: {e}. Falling back to in-memory cache.")
         _redis_client = None
