@@ -4,8 +4,76 @@ from typing import Any, Optional
 from utils import logger
 from redis.exceptions import ConnectionError
 from redis.asyncio.cluster import RedisCluster
-from redis.credentials import IAMCredentialsProvider
 from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# Local ElastiCache IAM credential provider (avoids redis-py 5.4 dependency)
+# ---------------------------------------------------------------------------
+# redis-py <6.0 does not yet bundle IAMCredentialsProvider.  Until it ships we
+# embed a minimal provider that generates SigV4 tokens using botocore.
+#
+# HIPAA §164.312(e)(1) – we always sign via HTTPS and enforce TLS when the
+# client connects below.
+
+from botocore.model import ServiceId  # type: ignore
+from botocore.signers import RequestSigner  # type: ignore
+import botocore.session  # type: ignore
+
+# Redis defines an abstract CredentialProvider base – import defensively.
+try:
+    from redis.credentials import CredentialProvider as _BaseCredProvider  # type: ignore
+except ImportError:  # redis 5.0 fallback name
+    from redis import CredentialProvider as _BaseCredProvider  # type: ignore
+
+
+class _ElastiCacheIAMProvider(_BaseCredProvider):
+    """Generate short-lived IAM auth tokens for ElastiCache.
+
+    The instance is **thread-safe** and reuses the underlying botocore session
+    so that each call to :py:meth:`get_credentials` is O(1).
+    """
+
+    def __init__(self, *, user_id: str, cache_endpoint: str, region: str):
+        self._user_id = user_id
+        self._cache_endpoint = cache_endpoint
+        self._region = region
+
+        # Keep session reference alive (see GH-2987 weakref bug)
+        self._session = botocore.session.get_session()
+        self._signer = RequestSigner(
+            ServiceId("elasticache"),
+            self._region,
+            "elasticache",
+            "v4",
+            self._session.get_credentials(),
+            self._session.get_component("event_emitter"),
+        )
+
+    # redis-py expects Tuple[str, str]
+    def get_credentials(self):  # type: ignore[override]
+        from urllib.parse import urlencode, urlunparse, ParseResult
+
+        query = {"Action": "connect", "User": self._user_id}
+        url = urlunparse(
+            ParseResult(
+                scheme="https",
+                netloc=self._cache_endpoint,
+                path="/",
+                params="",
+                query=urlencode(query),
+                fragment="",
+            )
+        )
+
+        signed = self._signer.generate_presigned_url(
+            {"method": "GET", "url": url, "body": {}, "headers": {}, "context": {}},
+            operation_name="connect",
+            expires_in=900,
+            region_name=self._region,
+        )
+
+        # Redis AUTH <username> <token> — token must omit scheme/host
+        return (self._user_id, signed.removeprefix("https://"))
 
 
 _raw_env_val = os.environ.get("REDIS")
@@ -64,17 +132,18 @@ _redis_iam_region: Optional[str] = (
     or os.environ.get("AWS_DEFAULT_REGION")
 )
 
-_iam_provider: Optional[IAMCredentialsProvider] = None  # initialised lazily
+# singleton provider instance
+_iam_provider: Optional[_ElastiCacheIAMProvider] = None  # initialised lazily
 
 
-def _get_iam_provider(cache_endpoint: str) -> Optional[IAMCredentialsProvider]:
+def _get_iam_provider(cache_endpoint: str) -> Optional[_ElastiCacheIAMProvider]:
     """Return a singleton IAMCredentialsProvider or None when IAM env vars absent."""
     global _iam_provider
     if _redis_iam_user is None:
         return None
 
     if _iam_provider is None:
-        _iam_provider = IAMCredentialsProvider(
+        _iam_provider = _ElastiCacheIAMProvider(
             user_id=_redis_iam_user,
             cache_endpoint=cache_endpoint,
             region=_redis_iam_region or "us-east-1",
