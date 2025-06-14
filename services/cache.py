@@ -25,22 +25,24 @@ from redis.credentials import CredentialProvider as _BaseCredProvider  # type: i
 
 
 class _ElastiCacheIAMProvider(_BaseCredProvider):
-    """Generate short-lived IAM auth tokens for ElastiCache.
+    """Generate SigV4 IAM authentication tokens for ElastiCache (Redis ≥7).
 
-    The instance is **thread-safe** and reuses the underlying botocore session
-    so that each call to :py:meth:`get_credentials` is O(1).
+    The AWS docs now recommend signing the **replication-group ID** (a.k.a.
+    *cache name*) rather than the DNS endpoint when building the presigned
+    request URL [1].  Older examples that signed the full *clustercfg* hostname
+    stop working once IAM auth is enforced on the server side, hence the
+    refactor.
 
     """
 
-    # DEBUG flag – set REDIS_DEBUG=1 to enable verbose tracing
     _debug_enabled = os.getenv("REDIS_DEBUG") == "1"
 
-    def __init__(self, *, user_id: str, cache_endpoint: str, region: str):
+    def __init__(self, *, user_id: str, cluster_name: str, region: str):
         self._user_id = user_id
-        self._cache_endpoint = cache_endpoint
+        self._cluster_name = cluster_name  # replication-group id, *not* the hostname
         self._region = region
 
-        # Keep session reference alive (see GH-2987 weakref bug)
+        # Prevent weak-ref GC (see redis-py issue #2987)
         self._session = botocore.session.get_session()
         self._signer = RequestSigner(
             ServiceId("elasticache"),
@@ -52,14 +54,14 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
         )
 
         if self._debug_enabled:
-            logger.info(
-                "[REDIS-Debug] Initialised IAM provider – user=%s endpoint=%s region=%s",
+            logger.debug(
+                "[REDIS-Debug] IAM provider init – user=%s cluster_name=%s region=%s",
                 self._user_id,
-                self._cache_endpoint,
+                self._cluster_name,
                 self._region,
             )
 
-    # redis-py expects Tuple[str, str]
+    # redis-py expects Tuple[str,str]
     def get_credentials(self):  # type: ignore[override]
         from urllib.parse import urlencode, urlunparse, ParseResult
 
@@ -67,7 +69,7 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
         url = urlunparse(
             ParseResult(
                 scheme="https",
-                netloc=self._cache_endpoint,
+                netloc=self._cluster_name,  # ← per AWS docs
                 path="/",
                 params="",
                 query=urlencode(query),
@@ -75,22 +77,22 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
             )
         )
 
-        signed = self._signer.generate_presigned_url(
+        signed_url = self._signer.generate_presigned_url(
             {"method": "GET", "url": url, "body": {}, "headers": {}, "context": {}},
             operation_name="connect",
             expires_in=900,
             region_name=self._region,
         )
 
-        token = signed.removeprefix("https://")
+        token = signed_url.removeprefix("https://")
+
         if self._debug_enabled:
-            # Only log a truncated hash of the token for audit – avoid leaking secrets.
             import hashlib, base64 as _b64
 
-            token_hash = _b64.b32encode(hashlib.sha256(token.encode()).digest())[:16].decode()
-            logger.info("[REDIS-Debug] Generated presigned token (sha256/32): %s", token_hash)
+            digest = hashlib.sha256(token.encode()).digest()
+            logger.debug("[REDIS-Debug] Generated token hash=%s", _b64.b32encode(digest)[:16].decode())
 
-        # Redis AUTH <username> <token> — token must omit scheme/host
+        # Redis AUTH <username> <token>
         return (self._user_id, token)
 
 
@@ -154,8 +156,12 @@ _redis_iam_region: Optional[str] = (
 _iam_provider: Optional[_ElastiCacheIAMProvider] = None  # initialised lazily
 
 
-def _get_iam_provider(cache_endpoint: str) -> Optional[_ElastiCacheIAMProvider]:
-    """Return a singleton IAMCredentialsProvider or None when IAM env vars absent."""
+def _get_iam_provider(cluster_name: str) -> Optional[_ElastiCacheIAMProvider]:
+    """Return a singleton IAMCredentialsProvider or None when IAM env vars absent.
+
+    *cluster_name* must be the replication-group ID (e.g. ``pl-voiceagent-redis``),
+    **not** the clustercfg DNS hostname.
+    """
     global _iam_provider
     if _redis_iam_user is None:
         return None
@@ -163,7 +169,7 @@ def _get_iam_provider(cache_endpoint: str) -> Optional[_ElastiCacheIAMProvider]:
     if _iam_provider is None:
         _iam_provider = _ElastiCacheIAMProvider(
             user_id=_redis_iam_user,
-            cache_endpoint=cache_endpoint,
+            cluster_name=cluster_name,
             region=_redis_iam_region or "us-east-1",
         )
     return _iam_provider
@@ -190,8 +196,13 @@ def _init_client() -> None:
         port = parsed.port or 6379
         is_ssl = True  # enforce TLS per HIPAA transmission-security requirements
 
-        # Decide which auth mechanism to use
-        provider = _get_iam_provider(host)
+        # Extract the *replication-group id* for token signing.  Example:
+        #   clustercfg.pl-voiceagent-redis.xxxxxx.cache.amazonaws.com → pl-voiceagent-redis
+        rg_id = host
+        if host.startswith("clustercfg."):
+            rg_id = host.split(".")[0].removeprefix("clustercfg.")
+
+        provider = _get_iam_provider(rg_id)
         if provider is None:
             logger.error("❌ REDIS_IAM_USER not configured – IAM authentication is mandatory. Falling back to in-memory cache.")
             _redis_client = None

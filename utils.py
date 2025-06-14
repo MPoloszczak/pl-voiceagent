@@ -24,7 +24,17 @@ def setup_logging(app_name="pl-voiceagent"):
     
     # Initialize named logger
     logger = logging.getLogger(app_name)
-    logger.setLevel(logging.INFO)
+
+    # Allow dynamic log level via environment variables. When REDIS_DEBUG or
+    # DEBUG_SECRETS is enabled we default to DEBUG; otherwise honour LOG_LEVEL
+    # or default INFO.
+    if os.getenv("REDIS_DEBUG") == "1" or os.getenv("DEBUG_SECRETS") == "1":
+        level = logging.DEBUG
+    else:
+        level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, level_name, logging.INFO)
+
+    logger.setLevel(level)
 
     if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
         handler = logging.StreamHandler(sys.stdout)
