@@ -3,7 +3,7 @@ import redis.asyncio as redis
 from typing import Any, Optional
 from utils import logger
 from redis.exceptions import ConnectionError, AuthenticationError
-from redis.asyncio.cluster import RedisCluster
+from redis.asyncio import RedisCluster
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
@@ -90,10 +90,17 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
             import hashlib, base64 as _b64
 
             digest = hashlib.sha256(token.encode()).digest()
-            logger.debug("[REDIS-Debug] Generated token hash=%s", _b64.b32encode(digest)[:16].decode())
+            logger.debug(
+                "[REDIS-Debug] Generated token hash=%s",
+                _b64.b32encode(digest)[:16].decode(),
+            )
 
         # Redis AUTH <username> <token>
         return (self._user_id, token)
+
+    async def get_credentials_async(self):  # type: ignore[override]
+        """Asynchronous wrapper returning IAM auth credentials."""
+        return self.get_credentials()
 
 
 _raw_env_val = os.environ.get("REDIS")
@@ -101,6 +108,7 @@ _raw_env_val = os.environ.get("REDIS")
 if not _raw_env_val:
     logger.error("REDIS environment variable is missing – cannot start cache client")
     raise RuntimeError("REDIS required for Redis connection")
+
 
 def _extract_url(raw: str) -> str:
     # Case 3 – JSON string
@@ -113,6 +121,7 @@ def _extract_url(raw: str) -> str:
         except json.JSONDecodeError:
             pass  # fall through to generic handling
     return raw
+
 
 redis_raw = _extract_url(_raw_env_val)
 
@@ -127,8 +136,8 @@ else:
     redis_url = f"rediss://{redis_raw}"
 
 
-
 _fallback_cache = {}  # type: ignore[var-annotated]
+
 
 # Helper to decide whether we should treat the URL as a cluster configuration
 def _is_cluster_endpoint(url: str) -> bool:
@@ -136,12 +145,13 @@ def _is_cluster_endpoint(url: str) -> bool:
     endpoint.  Those require redis-cluster topology support."""
     return "clustercfg" in url
 
+
 # Lazily initialise a Redis/RedisCluster client so that connection errors don't
 # occur at *import* time and can instead be handled gracefully at runtime.
 _redis_client = None  # will be set on first use
 
 # ---------------------------------------------------------------------------
-#AWS ElastiCache IAM authentication (RBAC)
+# AWS ElastiCache IAM authentication (RBAC)
 # ---------------------------------------------------------------------------
 
 
@@ -175,7 +185,6 @@ def _get_iam_provider(cluster_name: str) -> Optional[_ElastiCacheIAMProvider]:
     return _iam_provider
 
 
-
 def _init_client() -> None:
     """Initialise the global ``_redis_client`` with cluster detection / TLS.
 
@@ -192,7 +201,13 @@ def _init_client() -> None:
         # Identify host / port and authentication strategy
         # ------------------------------------------------------------------
         parsed = urlparse(redis_url)
-        host = parsed.hostname or redis_url.replace("rediss://", "").replace("redis://", "").split("/")[0].split(":")[0]
+        host = (
+            parsed.hostname
+            or redis_url.replace("rediss://", "")
+            .replace("redis://", "")
+            .split("/")[0]
+            .split(":")[0]
+        )
         port = parsed.port or 6379
         is_ssl = True  # enforce TLS per HIPAA transmission-security requirements
 
@@ -200,11 +215,16 @@ def _init_client() -> None:
         #   clustercfg.pl-voiceagent-redis.xxxxxx.cache.amazonaws.com → pl-voiceagent-redis
         rg_id = host
         if host.startswith("clustercfg."):
-            rg_id = host.split(".")[0].removeprefix("clustercfg.")
+            remainder = host[len("clustercfg.") :]
+            rg_id = remainder.split(".")[0]
+        else:
+            rg_id = host.split(".")[0]
 
         provider = _get_iam_provider(rg_id)
         if provider is None:
-            logger.error("❌ REDIS_IAM_USER not configured – IAM authentication is mandatory. Falling back to in-memory cache.")
+            logger.error(
+                "❌ REDIS_IAM_USER not configured – IAM authentication is mandatory. Falling back to in-memory cache."
+            )
             _redis_client = None
             return
 
@@ -243,7 +263,9 @@ def _init_client() -> None:
                 ssl_cert_reqs=None,
                 **auth_kwargs,
             )
-            logger.info("🔗 Initialised standalone Redis client using IAM authentication")
+            logger.info(
+                "🔗 Initialised standalone Redis client using IAM authentication"
+            )
     except AuthenticationError as ae:
         logger.error(
             "🛂 Redis authentication failed for IAM user '%s': %s. Check that the ElastiCache user exists, is enabled, and is configured for IAM authentication.",
@@ -252,7 +274,9 @@ def _init_client() -> None:
         )
         _redis_client = None
     except Exception as e:  # broad but we must not crash import
-        logger.error(f"❌ Failed to initialise Redis client: {e}. Falling back to in-memory cache.")
+        logger.error(
+            f"❌ Failed to initialise Redis client: {e}. Falling back to in-memory cache."
+        )
         _redis_client = None
 
 
@@ -261,7 +285,9 @@ def _init_client() -> None:
 # ----------------------------------------------------------------------------
 
 
-async def set_json(key: str, obj: Any, ttl: int = 900):  # noqa: D401 – keep original signature
+async def set_json(
+    key: str, obj: Any, ttl: int = 900
+):  # noqa: D401 – keep original signature
     """Serialize *obj* to JSON and store it under *key*.
 
     Falls back to an in-process dict when Redis is unavailable so the rest of
@@ -278,7 +304,9 @@ async def set_json(key: str, obj: Any, ttl: int = 900):  # noqa: D401 – keep o
             key,
         )
         _fallback_cache[key] = payload
-        raise CacheWriteError("Redis client unavailable – data stored only in local memory")
+        raise CacheWriteError(
+            "Redis client unavailable – data stored only in local memory"
+        )
 
     try:
         result = await _redis_client.set(key, payload, ex=ttl)  # type: ignore[attr-defined]
@@ -316,7 +344,9 @@ async def get_json(key: str):  # noqa: D401 – keep original signature
         try:
             raw = await _redis_client.get(key)  # type: ignore[attr-defined]
         except ConnectionError as ce:
-            logger.error(f"🔌 Redis connection error on GET for '{key}': {ce}. Resorting to in-memory cache.")
+            logger.error(
+                f"🔌 Redis connection error on GET for '{key}': {ce}. Resorting to in-memory cache."
+            )
             raw = _fallback_cache.get(key)
 
     if raw is None:
@@ -325,6 +355,7 @@ async def get_json(key: str):  # noqa: D401 – keep original signature
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
 
 # ---------------------------------------------------------------------------
 # SECURITY (HIPAA) NOTE
@@ -336,7 +367,9 @@ async def get_json(key: str):  # noqa: D401 – keep original signature
 # with HIPAA §164.312(e)(1) – Transmission Security.
 # ---------------------------------------------------------------------------
 
+
 # Custom exception for cache write failures – allows callers to handle
 class CacheWriteError(RuntimeError):
     """Raised when data cannot be persisted to Redis."""
-    pass 
+
+    pass
