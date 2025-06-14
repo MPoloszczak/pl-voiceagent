@@ -228,6 +228,23 @@ def _init_client() -> None:
                 _iam_user_dbg,
                 _iam_token_dbg[:120],
             )
+
+            from urllib.parse import parse_qs, urlsplit
+            from datetime import datetime, timezone
+
+            # Extract X-Amz-Date from the presigned URL for skew diagnostics
+            qs = parse_qs(urlsplit("https://" + _iam_token_dbg).query)
+            ts_raw = qs.get("X-Amz-Date", [None])[0]
+            if ts_raw:
+                ts_token = datetime.strptime(ts_raw, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+                now_utc = datetime.now(timezone.utc)
+                skew_sec = abs((now_utc - ts_token).total_seconds())
+                logger.info(
+                    "🕒 SigV4 token time=%s | local time=%s | clock skew %.2fs",
+                    ts_token.isoformat(),
+                    now_utc.isoformat(),
+                    skew_sec,
+                )
         except Exception as _cred_dbg_exc:  # noqa: BLE001 – diagnostic only
             logger.warning("⚠️  Failed to emit IAM token debug info: %s", _cred_dbg_exc)
 #REMOVE IN PROD^
