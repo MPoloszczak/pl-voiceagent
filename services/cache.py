@@ -4,6 +4,8 @@ from typing import Any, Optional
 from utils import logger
 from redis.exceptions import ConnectionError
 from redis.asyncio.cluster import RedisCluster
+from redis.credentials import IAMCredentialsProvider
+from urllib.parse import urlparse
 
 
 _raw_env_val = os.environ.get("REDIS")
@@ -51,15 +53,35 @@ def _is_cluster_endpoint(url: str) -> bool:
 _redis_client = None  # will be set on first use
 
 # ---------------------------------------------------------------------------
-# Optional: AWS ElastiCache Auth Token handling
+#AWS ElastiCache IAM authentication (RBAC)
 # ---------------------------------------------------------------------------
 
-# HIPAA Compliance: Avoid logging raw auth token (PHI/PII)
-# The token is stored in environment variable REDIS_AUTH_TOKEN and will be
-# supplied as the password parameter when instantiating the Redis client.  We
-# never output this value to logs.
 
-_redis_auth_token: Optional[str] = os.environ.get("REDIS_AUTH_TOKEN")
+_redis_iam_user: Optional[str] = os.environ.get("REDIS_IAM_USER")
+_redis_iam_region: Optional[str] = (
+    os.environ.get("REDIS_IAM_REGION")
+    or os.environ.get("AWS_REGION")
+    or os.environ.get("AWS_DEFAULT_REGION")
+)
+
+_iam_provider: Optional[IAMCredentialsProvider] = None  # initialised lazily
+
+
+def _get_iam_provider(cache_endpoint: str) -> Optional[IAMCredentialsProvider]:
+    """Return a singleton IAMCredentialsProvider or None when IAM env vars absent."""
+    global _iam_provider
+    if _redis_iam_user is None:
+        return None
+
+    if _iam_provider is None:
+        _iam_provider = IAMCredentialsProvider(
+            user_id=_redis_iam_user,
+            cache_endpoint=cache_endpoint,
+            region=_redis_iam_region or "us-east-1",
+        )
+    return _iam_provider
+
+
 
 def _init_client() -> None:
     """Initialise the global ``_redis_client`` with cluster detection / TLS.
@@ -73,24 +95,46 @@ def _init_client() -> None:
         return  # already initialised
 
     try:
-        if _is_cluster_endpoint(redis_url):
-            # ElastiCache cluster mode ("clustercfg.") → use RedisCluster
-            _redis_client = RedisCluster.from_url(
-                redis_url,
+        # ------------------------------------------------------------------
+        # Identify host / port and authentication strategy
+        # ------------------------------------------------------------------
+        parsed = urlparse(redis_url)
+        host = parsed.hostname or redis_url.replace("rediss://", "").replace("redis://", "").split("/")[0].split(":")[0]
+        port = parsed.port or 6379
+        is_ssl = True  # enforce TLS per HIPAA transmission-security requirements
+
+        # Decide which auth mechanism to use
+        provider = _get_iam_provider(host)
+        if provider is None:
+            logger.error("❌ REDIS_IAM_USER not configured – IAM authentication is mandatory. Falling back to in-memory cache.")
+            _redis_client = None
+            return
+
+        auth_kwargs: dict[str, Any] = {"credentials_provider": provider}
+
+        # ------------------------------------------------------------------
+        # Instantiate client (cluster vs standalone)
+        # ------------------------------------------------------------------
+        if _is_cluster_endpoint(host):
+            _redis_client = RedisCluster(
+                host=host,
+                port=port,
+                ssl=is_ssl,
                 decode_responses=True,
-                ssl=True,
-                ssl_cert_reqs=None,  # skip server cert validation – ensure SG/Private-Link enforcement instead
-                password=_redis_auth_token,
+                ssl_cert_reqs=None,
+                **auth_kwargs,
             )
-            logger.info("🔗 Initialised RedisCluster client (cluster endpoint detected)")
+            logger.info("🔗 Initialised RedisCluster client using IAM authentication")
         else:
-            _redis_client = redis.from_url(
-                redis_url,
+            _redis_client = redis.Redis(
+                host=host,
+                port=port,
+                ssl=is_ssl,
                 decode_responses=True,
-                ssl_cert_reqs=None,                
-                password=_redis_auth_token,
+                ssl_cert_reqs=None,
+                **auth_kwargs,
             )
-            logger.info("🔗 Initialised standalone Redis client")
+            logger.info("🔗 Initialised standalone Redis client using IAM authentication")
     except Exception as e:  # broad but we must not crash import
         logger.error(f"❌ Failed to initialise Redis client: {e}. Falling back to in-memory cache.")
         _redis_client = None
