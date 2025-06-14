@@ -86,12 +86,17 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
         # Redis AUTH <username> <token>
         return (self._user_id, token)
 
+    async def get_credentials_async(self):  # type: ignore[override]
+        """Asynchronous variant for redis-py >=5.3."""
+        return self.get_credentials()
+
 
 _raw_env_val = os.environ.get("REDIS")
 
 if not _raw_env_val:
     logger.error("REDIS environment variable is missing – cannot start cache client")
     raise RuntimeError("REDIS required for Redis connection")
+
 
 def _extract_url(raw: str) -> str:
     # Case 3 – JSON string
@@ -104,6 +109,7 @@ def _extract_url(raw: str) -> str:
         except json.JSONDecodeError:
             pass  # fall through to generic handling
     return raw
+
 
 redis_raw = _extract_url(_raw_env_val)
 
@@ -118,8 +124,8 @@ else:
     redis_url = f"rediss://{redis_raw}"
 
 
-
 _fallback_cache = {}  # type: ignore[var-annotated]
+
 
 # Helper to decide whether we should treat the URL as a cluster configuration
 def _is_cluster_endpoint(url: str) -> bool:
@@ -127,20 +133,19 @@ def _is_cluster_endpoint(url: str) -> bool:
     endpoint.  Those require redis-cluster topology support."""
     return "clustercfg" in url
 
+
 # Lazily initialise a Redis/RedisCluster client so that connection errors don't
 # occur at *import* time and can instead be handled gracefully at runtime.
 _redis_client = None  # will be set on first use
 
 # ---------------------------------------------------------------------------
-#AWS ElastiCache IAM authentication (RBAC)
+# AWS ElastiCache IAM authentication (RBAC)
 # ---------------------------------------------------------------------------
 
 
 _redis_iam_user: Optional[str] = os.environ.get("REDIS_IAM_USER")
 _redis_iam_region: Optional[str] = (
-    os.environ.get("REDIS_IAM_REGION")
-    or os.environ.get("AWS_REGION")
-    or os.environ.get("AWS_DEFAULT_REGION")
+    os.environ.get("REDIS_IAM_REGION") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
 )
 
 # singleton provider instance
@@ -164,7 +169,6 @@ def _get_iam_provider(cluster_name: str) -> Optional[_ElastiCacheIAMProvider]:
             region=_redis_iam_region or "us-east-1",
         )
     return _iam_provider
-
 
 
 def _init_client() -> None:
@@ -195,7 +199,9 @@ def _init_client() -> None:
 
         provider = _get_iam_provider(rg_id)
         if provider is None:
-            logger.error("❌ REDIS_IAM_USER not configured – IAM authentication is mandatory. Falling back to in-memory cache.")
+            logger.error(
+                "❌ REDIS_IAM_USER not configured – IAM authentication is mandatory. Falling back to in-memory cache."
+            )
             _redis_client = None
             return
 
@@ -308,6 +314,7 @@ async def get_json(key: str):  # noqa: D401 – keep original signature
     except json.JSONDecodeError:
         return None
 
+
 # ---------------------------------------------------------------------------
 # SECURITY (HIPAA) NOTE
 #
@@ -318,7 +325,9 @@ async def get_json(key: str):  # noqa: D401 – keep original signature
 # with HIPAA §164.312(e)(1) – Transmission Security.
 # ---------------------------------------------------------------------------
 
+
 # Custom exception for cache write failures – allows callers to handle
 class CacheWriteError(RuntimeError):
     """Raised when data cannot be persisted to Redis."""
-    pass 
+
+    pass
