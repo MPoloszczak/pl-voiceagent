@@ -191,16 +191,20 @@ def _init_client() -> None:
         port = parsed.port or 6379
         is_ssl = True  # enforce TLS per HIPAA transmission-security requirements
 
-        # Extract the *replication-group ID* (e.g. ``pl-voiceagent-redis``) that must be
-        # used as the *cache name* when generating the SigV4 token.  According to the
-        # AWS docs, the token **must sign the replication-group ID**, *not* the DNS
-        # hostname.  In practice this is the portion immediately following the optional
-        # ``clustercfg.`` prefix up to the first dot.
+       
 
         # Strip the cluster-configuration prefix when present
         rg_id_host_part = host.removeprefix("clustercfg.")
         # Take the label before the first dot so that we drop the AWS domain suffix
         rg_id = rg_id_host_part.split(".")[0]
+
+        # ------------------------------------------------------------------
+        # TEMPORARY DIAGNOSTIC – emit the derived replication-group ID so we
+        # can verify that the correct value is being signed. This will be
+        # removed once connectivity has been confirmed in the dev
+        # environment.
+        # ------------------------------------------------------------------
+        logger.info("🪪 Derived replication-group ID for IAM signing: '%s'", rg_id)
 
         provider = _get_iam_provider(rg_id)
         if provider is None:
