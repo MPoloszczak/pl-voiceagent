@@ -84,10 +84,15 @@ def _load_secrets_from_aws() -> None:
             return
 
         injected = 0
+        if os.getenv("DEBUG_SECRETS") == "1" or os.getenv("REDIS_DEBUG") == "1":
+            logger.info("[Secrets-Debug] Inspecting retrieved secrets keys: %s", list(secrets.keys()))
+
         for key, value in secrets.items():
             if key not in os.environ:
                 os.environ[key] = str(value)
                 injected += 1
+            elif os.getenv("DEBUG_SECRETS") == "1" or os.getenv("REDIS_DEBUG") == "1":
+                logger.info("[Secrets-Debug] Skipped existing env key %s", key)
         logger.info("🔐 Loaded %d secrets from Secrets Manager", injected)
         _SECRETS_LOADED = True
     except Exception as e:  # broad catch to avoid startup failure

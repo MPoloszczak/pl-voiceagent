@@ -31,7 +31,11 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
 
     The instance is **thread-safe** and reuses the underlying botocore session
     so that each call to :py:meth:`get_credentials` is O(1).
+
     """
+
+    # DEBUG flag – set REDIS_DEBUG=1 to enable verbose tracing
+    _debug_enabled = os.getenv("REDIS_DEBUG") == "1"
 
     def __init__(self, *, user_id: str, cache_endpoint: str, region: str):
         self._user_id = user_id
@@ -48,6 +52,14 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
             self._session.get_credentials(),
             self._session.get_component("event_emitter"),
         )
+
+        if self._debug_enabled:
+            logger.info(
+                "[REDIS-Debug] Initialised IAM provider – user=%s endpoint=%s region=%s",
+                self._user_id,
+                self._cache_endpoint,
+                self._region,
+            )
 
     # redis-py expects Tuple[str, str]
     def get_credentials(self):  # type: ignore[override]
@@ -72,8 +84,16 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
             region_name=self._region,
         )
 
+        token = signed.removeprefix("https://")
+        if self._debug_enabled:
+            # Only log a truncated hash of the token for audit – avoid leaking secrets.
+            import hashlib, base64 as _b64
+
+            token_hash = _b64.b32encode(hashlib.sha256(token.encode()).digest())[:16].decode()
+            logger.info("[REDIS-Debug] Generated presigned token (sha256/32): %s", token_hash)
+
         # Redis AUTH <username> <token> — token must omit scheme/host
-        return (self._user_id, signed.removeprefix("https://"))
+        return (self._user_id, token)
 
 
 _raw_env_val = os.environ.get("REDIS")
@@ -178,6 +198,17 @@ def _init_client() -> None:
             logger.error("❌ REDIS_IAM_USER not configured – IAM authentication is mandatory. Falling back to in-memory cache.")
             _redis_client = None
             return
+
+        if os.getenv("REDIS_DEBUG") == "1":
+            logger.info(
+                "[REDIS-Debug] Creating redis client – host=%s port=%s cluster=%s tls=%s user=%s region=%s",
+                host,
+                port,
+                _is_cluster_endpoint(host),
+                is_ssl,
+                _redis_iam_user,
+                _redis_iam_region,
+            )
 
         auth_kwargs: dict[str, Any] = {"credential_provider": provider}
 
