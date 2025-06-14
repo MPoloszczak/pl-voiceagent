@@ -179,7 +179,7 @@ def _init_client() -> None:
             _redis_client = None
             return
 
-        auth_kwargs: dict[str, Any] = {"credentials_provider": provider}
+        auth_kwargs: dict[str, Any] = {"credential_provider": provider}
 
         # ------------------------------------------------------------------
         # Instantiate client (cluster vs standalone)
