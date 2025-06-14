@@ -35,7 +35,8 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
 
     """
 
-    _debug_enabled = os.getenv("REDIS_DEBUG") == "1"
+    # Debug logging removed per request – we no longer emit client-side IAM
+    # token generation traces.  The code path keeps working silently.
 
     def __init__(self, *, user_id: str, cluster_name: str, region: str):
         self._user_id = user_id
@@ -53,13 +54,7 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
             self._session.get_component("event_emitter"),
         )
 
-        if self._debug_enabled:
-            logger.debug(
-                "[REDIS-Debug] IAM provider init – user=%s cluster_name=%s region=%s",
-                self._user_id,
-                self._cluster_name,
-                self._region,
-            )
+        # No debug log.
 
     # redis-py expects Tuple[str,str]
     def get_credentials(self):  # type: ignore[override]
@@ -86,11 +81,7 @@ class _ElastiCacheIAMProvider(_BaseCredProvider):
 
         token = signed_url.removeprefix("https://")
 
-        if self._debug_enabled:
-            import hashlib, base64 as _b64
-
-            digest = hashlib.sha256(token.encode()).digest()
-            logger.debug("[REDIS-Debug] Generated token hash=%s", _b64.b32encode(digest)[:16].decode())
+        # Suppress token hash debug log.
 
         # Redis AUTH <username> <token>
         return (self._user_id, token)
@@ -208,16 +199,7 @@ def _init_client() -> None:
             _redis_client = None
             return
 
-        if os.getenv("REDIS_DEBUG") == "1":
-            logger.info(
-                "[REDIS-Debug] Creating redis client – host=%s port=%s cluster=%s tls=%s user=%s region=%s",
-                host,
-                port,
-                _is_cluster_endpoint(host),
-                is_ssl,
-                _redis_iam_user,
-                _redis_iam_region,
-            )
+        # Removed verbose client creation debug log.
 
         auth_kwargs: dict[str, Any] = {"credential_provider": provider}
 

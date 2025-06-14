@@ -28,7 +28,7 @@ def setup_logging(app_name="pl-voiceagent"):
     # Allow dynamic log level via environment variables. When REDIS_DEBUG or
     # DEBUG_SECRETS is enabled we default to DEBUG; otherwise honour LOG_LEVEL
     # or default INFO.
-    if os.getenv("REDIS_DEBUG") == "1" or os.getenv("DEBUG_SECRETS") == "1":
+    if os.getenv("DEBUG_SECRETS") == "1":
         level = logging.DEBUG
     else:
         level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -94,14 +94,14 @@ def _load_secrets_from_aws() -> None:
             return
 
         injected = 0
-        if os.getenv("DEBUG_SECRETS") == "1" or os.getenv("REDIS_DEBUG") == "1":
+        if os.getenv("DEBUG_SECRETS") == "1":
             logger.info("[Secrets-Debug] Inspecting retrieved secrets keys: %s", list(secrets.keys()))
 
         for key, value in secrets.items():
             if key not in os.environ:
                 os.environ[key] = str(value)
                 injected += 1
-            elif os.getenv("DEBUG_SECRETS") == "1" or os.getenv("REDIS_DEBUG") == "1":
+            elif os.getenv("DEBUG_SECRETS") == "1":
                 logger.info("[Secrets-Debug] Skipped existing env key %s", key)
         logger.info("🔐 Loaded %d secrets from Secrets Manager", injected)
         _SECRETS_LOADED = True
