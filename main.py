@@ -65,18 +65,13 @@ except ModuleNotFoundError:  # local twilio.py likely masked the package
 twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
 async def verify_twilio_signature(request: Request):
-    """Dependency that validates the X-Twilio-Signature header."""
+    """Validate the X-Twilio-Signature header (no CallToken fallback)."""
     if not twilio_validator:
-        # Mis-configuration – treat as server error to avoid false sense of security
         raise HTTPException(status_code=500, detail="Twilio signature validator not configured")
-
-    # ----------------------------------------
-    # 0) Check X-Twilio-Signature (preferred & always available)
-    # ----------------------------------------
 
     signature = request.headers.get("X-Twilio-Signature", "")
 
-    # Rebuild URL Twilio used (consider proxy headers)
+    # Reconstruct the absolute URL Twilio used when signing (respect proxies)
     forwarded_proto = request.headers.get("x-forwarded-proto")
     host = request.headers.get("host")
     if forwarded_proto and host:
@@ -88,70 +83,50 @@ async def verify_twilio_signature(request: Request):
 
     raw_body_bytes = await request.body()
 
-    # Log headers at INFO with masking of sensitive values for HIPAA compliance
+    # Audit headers (masked) for debugging / HIPAA logging
     logger.info(
         "[AUTH] Twilio webhook headers (sanitised): %s",
         sanitize_headers(dict(request.headers)),
     )
 
-    # Fast path – if signature validates, we are done
-    if signature and twilio_validator.validate(url_used, raw_body_bytes.decode(), signature):
-        logger.info("[AUTH] X-Twilio-Signature validated for CallSid=%s", request.query_params.get("CallSid", "unknown"))
-        return  # dependency passes, request continues
+    from urllib.parse import parse_qs
 
-    logger.warning("[AUTH] Signature validation failed or header missing – falling back to CallToken checks")
+    params_multi = parse_qs(raw_body_bytes.decode(), keep_blank_values=True)
 
-    # ----------------------------------------
-    # 1) Extract and validate CallToken (secondary)
-    # ----------------------------------------
+    # ---------------------------------------------------------------------
+    # Robust Twilio signature validation with graceful fallbacks
+    # ---------------------------------------------------------------------
+    # 1) Standard form-encoded payloads (Twilio Voice default)
+    # 2) JSON / raw payloads (e.g. Functions, Flex, etc.)
+    #
+    # HIPAA §164.312(b) – We deliberately *avoid* logging the raw signature
+    # while preserving a full audit trail of the validation outcome.
 
-    from urllib.parse import parse_qs, unquote_plus
+    content_type = request.headers.get("content-type", "").lower()
+    validated = False
 
-    form_dict = {k: v[0] for k, v in parse_qs(raw_body_bytes.decode()).items()}
-    call_token_enc = form_dict.get("CallToken")
+    # --- Primary strategy: application/x-www-form-urlencoded --------------
+    if content_type.startswith("application/x-www-form-urlencoded"):
+        # Pass the *multi-value* dict directly so that the Twilio helper can
+        # correctly handle repeated parameters via `getlist`/`getall`.
+        if signature and twilio_validator.validate(url_used, params_multi, signature):
+            validated = True
 
-    if not call_token_enc:
-        logger.warning("[AUTH] CallToken missing in request – rejecting")
-        raise HTTPException(status_code=403, detail="CallToken missing")
+    # --- Fallback strategy: treat body as opaque string --------------------
+    if not validated:
+        body_str = raw_body_bytes.decode()
+        if signature and twilio_validator.validate(url_used, body_str, signature):
+            validated = True
 
-    try:
-        call_token_json = json.loads(unquote_plus(call_token_enc))
-        parent_token = call_token_json.get("parentCallInfoToken")
-    except Exception as e:
-        logger.warning("[AUTH] Malformed CallToken JSON: %s", e)
-        raise HTTPException(status_code=403, detail="Invalid CallToken")
+    if validated:
+        logger.info(
+            "[AUTH] X-Twilio-Signature validated for CallSid=%s",
+            (params_multi.get("CallSid") or ["unknown"])[0],
+        )
+        return
 
-    if not parent_token:
-        raise HTTPException(status_code=403, detail="parentCallInfoToken missing")
-
-    account_sid_env = os.getenv("ACCOUNT_SID") or os.getenv("TWILIO_ACCOUNT_SID")
-
-    # Decode CallToken *without* signature verification – Twilio does not publish the
-    # verifying key for standard accounts.  We rely on claim-based checks per
-    # Twilio docs (https://www.twilio.com/docs/voice/trusted-calling-with-shakenstir#anatomy-of-a-calltoken).
-
-    try:
-        decoded_payload: dict = jwt.decode(parent_token, options={"verify_signature": False})
-        logger.info("[AUTH] CallToken parsed – signature not verified (public key unavailable for this account tier)")
-    except jwt.PyJWTError as e:
-        logger.warning("[AUTH] CallToken JWT parse failed: %s", e)
-        raise HTTPException(status_code=403, detail="Invalid CallToken token")
-
-    # ---- Claim checks ----
-    import time
-
-    if account_sid_env and decoded_payload.get("iss") != account_sid_env:
-        raise HTTPException(status_code=403, detail="Issuer mismatch")
-
-    # 5-minute clock-skew tolerance
-    iat = decoded_payload.get("iat")
-    if not isinstance(iat, (int, float)) or abs(time.time() - iat) > 300:
-        raise HTTPException(status_code=403, detail="Token expired or not yet valid")
-
-    if decoded_payload.get("callSid") != form_dict.get("CallSid"):
-        raise HTTPException(status_code=403, detail="callSid claim mismatch")
-
-    logger.info("[AUTH] CallToken validated for CallSid=%s", decoded_payload.get("callSid"))
+    logger.warning("[AUTH] X-Twilio-Signature validation failed – rejecting request")
+    raise HTTPException(status_code=403, detail="Invalid Twilio Signature")
 
 # 3. Twilio WebSocket Basic-Auth validation (AccountSid:AuthToken)
 
