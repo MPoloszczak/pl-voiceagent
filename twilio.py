@@ -198,20 +198,14 @@ class TwilioService:
         
         proto = "wss"  # Always secure per Twilio requirements
 
-        if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
-            error_msg = (
-                "[AUTH] TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set for authenticated WebSocket stream"
-            )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
+        websocket_url = f"{proto}://{host}/twilio-stream"
 
-        websocket_url = f"{proto}://{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}@{host}/twilio-stream"
+        
 
- 
         twiml = (
             f"""<Response>
     <Connect>
-        <Stream url="{websocket_url}" track="inbound_track" />
+        <Stream url=\"{websocket_url}\" track=\"inbound_track\" />
     </Connect>
 </Response>"""
         )

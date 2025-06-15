@@ -245,40 +245,62 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 
 
 async def authorize_twilio_websocket(websocket: WebSocket) -> bool:
-    """Rejects WebSocket connections that do not present valid Twilio Basic Auth."""
-    auth_header = websocket.headers.get("Authorization", "")
+    """Validate Twilio's WebSocket handshake solely via X-Twilio-Signature."""
 
-    # Verbose logging to diagnose 403s – **no PHI** in Basic creds (they are SID + token)
     from utils import sanitize_headers
-    logger.info("[AUTH] WebSocket handshake headers: %s", sanitize_headers(dict(websocket.headers)))
-    logger.info("[AUTH] Authorization header raw value: %s", auth_header)
 
-    if not auth_header.startswith("Basic "):
+    # Diagnostic logging (no PHI)
+    safe_hdrs = sanitize_headers(dict(websocket.headers))
+    logger.info("[AUTH] WebSocket handshake headers: %s", safe_hdrs)
+
+    signature = websocket.headers.get("X-Twilio-Signature", "")
+
+    if not (signature and twilio_validator):
+        logger.warning("[AUTH] Missing X-Twilio-Signature – rejecting WebSocket")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return False
 
-    # Decode and log components (token masked partially for security)
+    # Reconstruct the absolute URL Twilio used when signing.
+    proto_hdr: str | None = (
+        websocket.headers.get("x-forwarded-proto")
+        or ("https" if websocket.url.scheme in ("wss", "https") else "http")
+    )
+    host_hdr: str | None = (
+        websocket.headers.get("x-forwarded-host")
+        or websocket.headers.get("host")
+    )
+
+    # Respect consolidated Forwarded header (RFC 7239)
+    fwd_header = websocket.headers.get("forwarded")
+    if fwd_header:
+        for part in fwd_header.split(";"):
+            kv = part.strip().split("=", 1)
+            if len(kv) != 2:
+                continue
+            k, v = kv[0].lower(), kv[1]
+            if k == "proto" and v:
+                proto_hdr = v
+            elif k == "host" and v:
+                host_hdr = v
+
+    url_used = f"{proto_hdr}://{host_hdr}{websocket.url.path}"
+    if websocket.url.query:
+        url_used += f"?{websocket.url.query}"
+
     try:
-        decoded_creds = base64.b64decode(auth_header.split(" ")[1]).decode()
-        account_sid, token = decoded_creds.split(":", 1)
-        token_preview = token[:6] + "..." if len(token) > 6 else token
-        logger.info("[AUTH] Decoded Basic auth – SID=%s, token preview=%s", account_sid, token_preview)
+        sig_valid = twilio_validator.validate(url_used, {}, signature)
     except Exception as e:
-        logger.warning("[AUTH] Failed to decode Authorization header: %s", e)
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return False
+        logger.info("[AUTH] Twilio validator raised during WS check: %s", e)
+        sig_valid = False
 
-    # We already decoded above; reuse variables
-    decoded = decoded_creds
-    account_sid = account_sid  # already
-    token = token
+    logger.info("[AUTH] WS Signature validation result=%s for URL=%s", sig_valid, url_used)
 
-    if account_sid != TWILIO_ACCOUNT_SID or token != TWILIO_AUTH_TOKEN:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return False
+    if sig_valid:
+        return True
 
-    # Passed validation
-    return True
+    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+    logger.warning("[AUTH] WebSocket handshake rejected – invalid signature")
+    return False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -385,9 +407,9 @@ async def twilio_stream_endpoint(websocket: WebSocket):
     """
     WebSocket endpoint for Twilio audio streaming.
 
-    The handshake is validated via Basic Auth (AccountSid:AuthToken) before the
-    connection is accepted. Unauthenticated attempts are closed with code 1008
-    per RFC 6455. Only `wss://` URLs are issued in production (see /voice).
+    The handshake is authenticated *only* via Twilio's `X-Twilio-Signature`.
+    Unauthenticated or improperly signed attempts are closed with code 1008
+    per RFC 6455.
     """
     if not await authorize_twilio_websocket(websocket):
         return  # Connection already closed due to auth failure
