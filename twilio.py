@@ -33,6 +33,9 @@ from oai import (
 from vad_events import interruption_manager, HUMAN_GAP_SEC
 from services.cache import get_json, set_json, CacheWriteError
 
+# Environment variables for Twilio authentication – used for WebSocket Basic Auth
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 
 class TwilioService:
     """Service for handling Twilio calls and WebSocket interactions"""
@@ -197,16 +200,28 @@ class TwilioService:
             # Only use ws:// for local development
             websocket_url = f"ws://{host}/twilio-stream"
 
-        logger.info(f"🔍 Generated WebSocket URL: {websocket_url}")
+        # Validate that auth credentials are available; if not, log a warning and
+        # fall back to unauthenticated WebSocket (Twilio will omit the header).
+        if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
+            logger.warning(
+                "[AUTH] TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set – WebSocket stream will be unauthenticated"
+            )
 
-        # Store CallSid in a pending connections dictionary to associate it later
-        self.websocket_connection_attempts[call_sid] = []
+        # Construct TwiML with Basic Auth credentials per Twilio docs:
+        # https://www.twilio.com/docs/voice/twiml/stream#security
+        twiml = f"""
+<Response>
+    <Connect>
+        <Stream url=\"{websocket_url}\" track=\"inbound_track\""" + (
+            f" username=\"{TWILIO_ACCOUNT_SID}\" password=\"{TWILIO_AUTH_TOKEN}\"" if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else ""
+        ) + "/>\n    </Connect>\n</Response>\n"""
 
-        # Generate TwiML response
-        twiml = TWIML_STREAM_TEMPLATE.format(websocket_url=websocket_url)
+        logger.debug(f"🔍 Generated TwiML response: {twiml}")
 
         logger.info(f"Instructing Twilio to connect to WebSocket: {websocket_url}")
-        logger.debug(f"🔍 Generated TwiML response: {twiml}")
+
+        # Store CallSid after sending response – track connection attempts
+        self.websocket_connection_attempts[call_sid] = []
 
         return Response(content=twiml, media_type="application/xml")
 
