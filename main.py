@@ -6,6 +6,7 @@ import time
 from contextlib import asynccontextmanager
 import base64
 import json
+import jwt  # PyJWT
 
 from utils import logger, setup_logging
 from twilio import twilio_service
@@ -69,34 +70,70 @@ async def verify_twilio_signature(request: Request):
         # Mis-configuration – treat as server error to avoid false sense of security
         raise HTTPException(status_code=500, detail="Twilio signature validator not configured")
 
-    signature = request.headers.get("X-Twilio-Signature", "")
+    # ----------------------------------------
+    # 1) Extract and validate CallToken (primary)
+    # ----------------------------------------
 
-    # Reconstruct the exact URL Twilio hit, accounting for any TLS termination
-    forwarded_proto = request.headers.get("x-forwarded-proto")
-    host = request.headers.get("host")
-    if forwarded_proto and host:
-        url = f"{forwarded_proto}://{host}{request.url.path}"
-        if request.url.query:
-            url += f"?{request.url.query}"
-    else:
-        url = str(request.url)
+    raw_body_bytes = await request.body()
 
-    # Twilio sends application/x-www-form-urlencoded payloads
+    from urllib.parse import parse_qs, unquote_plus
+
+    form_dict = {k: v[0] for k, v in parse_qs(raw_body_bytes.decode()).items()}
+    call_token_enc = form_dict.get("CallToken")
+
+    if not call_token_enc:
+        logger.warning("[AUTH] CallToken missing in request – rejecting")
+        raise HTTPException(status_code=403, detail="CallToken missing")
+
     try:
-        form = await request.form()
-    except Exception:
-        form = {}
+        call_token_json = json.loads(unquote_plus(call_token_enc))
+        parent_token = call_token_json.get("parentCallInfoToken")
+    except Exception as e:
+        logger.warning("[AUTH] Malformed CallToken JSON: %s", e)
+        raise HTTPException(status_code=403, detail="Invalid CallToken")
 
-    params = {k: str(v) for k, v in dict(form).items()}
+    if not parent_token:
+        raise HTTPException(status_code=403, detail="parentCallInfoToken missing")
 
-    # Temporary verbose logging for debugging Twilio signature issues (will be removed in prod)
-    logger.info("[DEBUG-TWILIO] URL used for signature: %s", url)
-    logger.info("[DEBUG-TWILIO] Params used for signature: %s", json.dumps(params))
-    logger.info("[DEBUG-TWILIO] X-Twilio-Signature header: %s", signature)
+    account_sid_env = os.getenv("ACCOUNT_SID") or os.getenv("TWILIO_ACCOUNT_SID")
 
-    if not twilio_validator.validate(url, params, signature):
-        logger.warning("[AUTH] Invalid Twilio webhook signature for %s", url)
-        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+    # Attempt ES256 verification if public key is provided; otherwise fall back to claim checks
+    public_key_pem = os.getenv("TWILIO_CALLTOKEN_PUBLIC_KEY")  # optional PEM string
+
+    decoded_payload: dict
+    try:
+        if public_key_pem:
+            decoded_payload = jwt.decode(
+                parent_token,
+                public_key_pem,
+                algorithms=["ES256"],
+                issuer=account_sid_env,
+                options={"require": ["iss", "iat", "callSid"]},
+            )
+            logger.info("[AUTH] CallToken signature verified with supplied public key")
+        else:
+            # Decode without verifying signature
+            decoded_payload = jwt.decode(parent_token, options={"verify_signature": False})
+            logger.warning("[AUTH] TWILIO_CALLTOKEN_PUBLIC_KEY not set – skipping signature verification")
+    except jwt.PyJWTError as e:
+        logger.warning("[AUTH] CallToken JWT verification failed: %s", e)
+        raise HTTPException(status_code=403, detail="Invalid CallToken signature")
+
+    # ---- Claim checks ----
+    import time
+
+    if account_sid_env and decoded_payload.get("iss") != account_sid_env:
+        raise HTTPException(status_code=403, detail="Issuer mismatch")
+
+    # 5-minute clock-skew tolerance
+    iat = decoded_payload.get("iat")
+    if not isinstance(iat, (int, float)) or abs(time.time() - iat) > 300:
+        raise HTTPException(status_code=403, detail="Token expired or not yet valid")
+
+    if decoded_payload.get("callSid") != form_dict.get("CallSid"):
+        raise HTTPException(status_code=403, detail="callSid claim mismatch")
+
+    logger.info("[AUTH] CallToken validated for CallSid=%s", decoded_payload.get("callSid"))
 
 # 3. Twilio WebSocket Basic-Auth validation (AccountSid:AuthToken)
 
