@@ -1,9 +1,11 @@
 import os
 import uvicorn
-from fastapi import FastAPI, Request, WebSocket, Response
+from fastapi import FastAPI, Request, WebSocket, Response, Depends, HTTPException, Header, status
 from aws_xray_sdk.core import patch_all
 import time
 from contextlib import asynccontextmanager
+import base64
+from twilio.request_validator import RequestValidator
 
 from utils import logger, setup_logging
 from twilio import twilio_service
@@ -15,6 +17,69 @@ patch_all()  # instrument std libs
 
 # Create the singleton instance after all imports are resolved
 deepgram_service = get_deepgram_service()
+
+# -------------------------
+# Authentication utilities
+# -------------------------
+
+# 1. AWS IAM – verify X-Amzn-Principal-Id injected by API Gateway
+
+def verify_iam_principal(principal_id: str | None = Header(None, alias="X-Amzn-Principal-Id")):
+    """Dependency that ensures a valid IAM principal header is present."""
+    if not principal_id:
+        logger.warning("[AUTH] Missing X-Amzn-Principal-Id header")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return principal_id
+
+# 2. Twilio request signature verification for webhook calls
+
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+if not TWILIO_AUTH_TOKEN:
+    logger.warning("TWILIO_AUTH_TOKEN is not set – Twilio signature validation will fail")
+
+twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+
+
+async def verify_twilio_signature(request: Request):
+    """Dependency that validates the X-Twilio-Signature header."""
+    if not twilio_validator:
+        # Mis-configuration – treat as server error to avoid false sense of security
+        raise HTTPException(status_code=500, detail="Twilio signature validator not configured")
+
+    signature = request.headers.get("X-Twilio-Signature", "")
+    url = str(request.url)
+    body = await request.body()
+
+    if not twilio_validator.validate(url, body, signature):
+        logger.warning("[AUTH] Invalid Twilio webhook signature for %s", url)
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+# 3. Twilio WebSocket Basic-Auth validation (AccountSid:AuthToken)
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+
+
+async def authorize_twilio_websocket(websocket: WebSocket) -> bool:
+    """Rejects WebSocket connections that do not present valid Twilio Basic Auth."""
+    auth_header = websocket.headers.get("Authorization", "")
+    if not auth_header.startswith("Basic "):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return False
+
+    try:
+        decoded = base64.b64decode(auth_header.split(" ")[1]).decode()
+        account_sid, token = decoded.split(":", 1)
+    except Exception:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return False
+
+    if account_sid != TWILIO_ACCOUNT_SID or token != TWILIO_AUTH_TOKEN:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return False
+
+    # Passed validation
+    return True
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -89,7 +154,7 @@ async def websocket_metrics():
         "connection_attempts": twilio_service.websocket_connection_attempts
     }
 
-@app.get("/websocket-status")
+@app.get("/websocket-status", dependencies=[Depends(verify_iam_principal)])
 async def websocket_status():
     """Return detailed status about active WebSocket connections and connection attempts."""
     return {
@@ -105,7 +170,7 @@ async def websocket_status():
         "connection_attempts": twilio_service.websocket_connection_attempts
     }
 
-@app.post("/voice")
+@app.post("/voice", dependencies=[Depends(verify_twilio_signature)])
 async def handle_incoming_call(request: Request):
     """
     Handle incoming Twilio voice calls and initiate a WebSocket stream.
@@ -120,14 +185,15 @@ async def handle_incoming_call(request: Request):
 async def twilio_stream_endpoint(websocket: WebSocket):
     """
     WebSocket endpoint for Twilio audio streaming.
-    
-    This endpoint:
-    1. Accepts the WebSocket connection from Twilio
-    2. Waits for initial events to extract CallSid
-    3. Processes incoming audio data
-    4. Sends periodic pings to maintain the connection
-    5. Handles disconnection gracefully
+
+    The handshake is validated via Basic Auth (AccountSid:AuthToken) before the
+    connection is accepted. Unauthenticated attempts are closed with code 1008
+    per RFC 6455. Only `wss://` URLs are issued in production (see /voice).
     """
+    if not await authorize_twilio_websocket(websocket):
+        return  # Connection already closed due to auth failure
+
+    # Delegate to TwilioService – it will call `accept()` internally after auth
     await twilio_service.handle_twilio_stream(websocket)
 
 # For direct execution
