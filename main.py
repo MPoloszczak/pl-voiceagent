@@ -287,13 +287,29 @@ async def authorize_twilio_websocket(websocket: WebSocket) -> bool:
     if websocket.url.query:
         url_used += f"?{websocket.url.query}"
 
+    sig_valid = False
     try:
         sig_valid = twilio_validator.validate(url_used, {}, signature)
     except Exception as e:
-        logger.info("[AUTH] Twilio validator raised during WS check: %s", e)
-        sig_valid = False
+        logger.info("[AUTH] Twilio validator raised during WS check (scheme %s): %s", proto_hdr, e)
 
-    logger.info("[AUTH] WS Signature validation result=%s for URL=%s", sig_valid, url_used)
+    # If first attempt failed, try alternate scheme (https <→ wss) because Twilio
+    # may canonicalise the scheme differently when computing the signature for
+    # WebSocket handshakes (see Twilio Media Streams security docs).
+    if not sig_valid:
+        alt_scheme = "wss" if proto_hdr == "https" else "https"
+        alt_url = url_used.replace(f"{proto_hdr}://", f"{alt_scheme}://", 1)
+        try:
+            sig_valid = twilio_validator.validate(alt_url, {}, signature)
+            logger.info(
+                "[AUTH] WS alt-scheme validation result=%s for URL=%s",
+                sig_valid,
+                alt_url,
+            )
+        except Exception as e:
+            logger.info("[AUTH] Twilio validator raised during WS alt check: %s", e)
+
+    logger.info("[AUTH] WS Signature validation final=%s", sig_valid)
 
     if sig_valid:
         return True
