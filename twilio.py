@@ -191,11 +191,6 @@ class TwilioService:
         host = request.headers.get("host", "localhost:8080")
         scheme = request.headers.get("x-forwarded-proto", "http")
 
-        safe_headers = sanitize_headers(dict(request.headers))
-        logger.info(f"🔍 Request headers: {safe_headers}")
-        logger.info(f"🔍 Detected host: {host}, scheme: {scheme}")
-
-        
         proto = "wss"  # Always secure per Twilio requirements
 
         websocket_url = f"{proto}://{host}/twilio-stream"
@@ -233,9 +228,6 @@ class TwilioService:
             "query_params": dict(websocket.query_params),
             "raw_path": str(websocket.url),
         }
-        logger.info(
-            f"🔍 WebSocket connection request details: {json.dumps(connection_request_details)}"
-        )
 
         # We'll identify the proper CallSid from the initial events
         call_sid = None
@@ -249,15 +241,6 @@ class TwilioService:
         callsid_timeout = 10  # seconds
         callsid_start_time = datetime.now().timestamp()
 
-        # Enhanced connection logging
-        headers = sanitize_headers(dict(websocket.headers))
-        logger.info(f"🔍 WebSocket connection request received, awaiting CallSid")
-        logger.info(f"🔍 WebSocket request headers: {json.dumps(headers)}")
-        logger.info(f"🔍 WebSocket connection path: {websocket.url.path}")
-        logger.info(
-            f"🔍 WebSocket connection query params: {dict(websocket.query_params)}"
-        )
-
         # Log connection attempt with placeholder for CallSid
         connection_attempt = {
             "timestamp": datetime.utcnow().isoformat(),
@@ -267,28 +250,17 @@ class TwilioService:
             "client_port": (
                 websocket.client.port if hasattr(websocket, "client") else "unknown"
             ),
-            "headers": headers,
+            "headers": connection_request_details["headers"],
             "status": "waiting_for_callsid",
         }
 
         # Store connection attempt temporarily until we get CallSid
         pending_connection_attempt = connection_attempt
 
-        logger.info(
-            f"WebSocket connection attempt from {connection_attempt['client_host']}:{connection_attempt['client_port']}, awaiting CallSid"
-        )
-
         try:
-            # Log pre-acceptance state
-            logger.info(
-                f"🔍 Attempting to accept WebSocket connection, awaiting CallSid"
-            )
-
             # Accept the WebSocket connection
             await websocket.accept()
-            logger.info(
-                f"✅ WebSocket connection successfully established, awaiting CallSid"
-            )
+            logger.debug("WebSocket connection established, awaiting CallSid")
 
             # Register DeepgramService main event loop for dispatching transcripts
             try:
@@ -329,9 +301,7 @@ class TwilioService:
                                 stream_sid = data.get("start", {}).get("streamSid")
 
                                 if call_sid:
-                                    logger.info(
-                                        f"🎯 CallSid identified: {call_sid}, StreamSid: {stream_sid}"
-                                    )
+                                    logger.debug("CallSid identified")
 
                                     # Store Stream SID for later use
                                     if stream_sid:
@@ -357,9 +327,7 @@ class TwilioService:
                                         call_sid, []
                                     ).append(pending_connection_attempt)
 
-                                    logger.info(
-                                        f"✅ WebSocket connection established successfully. Call: {call_sid}, Session: {session_id}"
-                                    )
+                                    logger.debug("WebSocket connection established successfully")
 
                                     # Prefer Stream SID from the start event
                                     if not stream_sid:

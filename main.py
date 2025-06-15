@@ -174,9 +174,11 @@ async def verify_twilio_signature(request: Request):
 
     # Log the representation chosen for signature calculation
     if form_params is not None:
-        logger.info("[AUTH] Using form parameters for validation: %s", form_params)
+        # (debug removed)
+        pass
     else:
-        logger.info("[AUTH] Using raw body string for validation: %s", body_str)
+        # (debug removed)
+        pass
 
     # ------------------------------------------------------------------
     # 3. Validate signature (primary path + safe fallback)
@@ -234,7 +236,7 @@ async def verify_twilio_signature(request: Request):
         )
         return  # ✅ Success
 
-    # Log at INFO for detailed debugging while retaining WARNING for alerting systems
+    # concise info no secret
     logger.info("[AUTH] X-Twilio-Signature validation failed – rejecting request")
     logger.warning("[AUTH] X-Twilio-Signature validation failed – rejecting request")
     raise HTTPException(status_code=403, detail="Invalid Twilio Signature")
@@ -249,10 +251,7 @@ async def authorize_twilio_websocket(websocket: WebSocket) -> bool:
 
     from utils import sanitize_headers
 
-    # Diagnostic logging (no PHI)
-    safe_hdrs = sanitize_headers(dict(websocket.headers))
-    logger.info("[AUTH] WebSocket handshake headers: %s", safe_hdrs)
-
+    # Suppressed verbose handshake header dump
     signature = websocket.headers.get("X-Twilio-Signature", "")
 
     if not (signature and twilio_validator):
@@ -301,15 +300,15 @@ async def authorize_twilio_websocket(websocket: WebSocket) -> bool:
         alt_url = url_used.replace(f"{proto_hdr}://", f"{alt_scheme}://", 1)
         try:
             sig_valid = twilio_validator.validate(alt_url, {}, signature)
-            logger.info(
-                "[AUTH] WS alt-scheme validation result=%s for URL=%s",
+            # validation attempt logged without exposing URL
+            logger.debug(
+                "[AUTH] WS alt-scheme validation result=%s",
                 sig_valid,
-                alt_url,
             )
         except Exception as e:
             logger.info("[AUTH] Twilio validator raised during WS alt check: %s", e)
 
-    logger.info("[AUTH] WS Signature validation final=%s", sig_valid)
+    logger.debug("[AUTH] WS Signature validation final=%s", sig_valid)
 
     if sig_valid:
         return True
