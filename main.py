@@ -5,6 +5,7 @@ from aws_xray_sdk.core import patch_all
 import time
 from contextlib import asynccontextmanager
 import base64
+import json
 
 from utils import logger, setup_logging
 from twilio import twilio_service
@@ -87,6 +88,11 @@ async def verify_twilio_signature(request: Request):
         form = {}
 
     params = {k: str(v) for k, v in dict(form).items()}
+
+    # Temporary verbose logging for debugging Twilio signature issues (will be removed in prod)
+    logger.info("[DEBUG-TWILIO] URL used for signature: %s", url)
+    logger.info("[DEBUG-TWILIO] Params used for signature: %s", json.dumps(params))
+    logger.info("[DEBUG-TWILIO] X-Twilio-Signature header: %s", signature)
 
     if not twilio_validator.validate(url, params, signature):
         logger.warning("[AUTH] Invalid Twilio webhook signature for %s", url)
