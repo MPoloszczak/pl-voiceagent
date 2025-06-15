@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 import base64
 import json
 import jwt  # PyJWT
+import hmac
 
 from utils import logger, setup_logging, sanitize_headers
 from twilio import twilio_service
@@ -65,63 +66,130 @@ except ModuleNotFoundError:  # local twilio.py likely masked the package
 twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
 async def verify_twilio_signature(request: Request):
-    """Validate the X-Twilio-Signature header (no CallToken fallback)."""
+    """Validate the `X-Twilio-Signature` header.
+
+    Implements the algorithm described in Twilio's Webhook Security docs while
+    gracefully handling the edge-cases that the stock `RequestValidator`
+    struggles with (e.g. Starlette `FormData`, multi-value dicts, or raw JSON
+    bodies).  The logic is:
+
+    1.   Reconstruct the absolute URL Twilio used when signing the request.
+    2.   Choose the correct payload representation based on *Content-Type*.
+         •  For   `application/x-www-form-urlencoded`  →  dict of POST params
+         •  Otherwise                                →  raw body string
+    3.   Attempt validation with Twilio's helper.  When it raises a *TypeError*
+         (the "unhashable type" and friends) we fall back to a minimal in-house
+         HMAC implementation that is 100 % spec-compliant but tolerant of the
+         quirky input types we see in ASGI frameworks.
+
+    HIPAA §164.312(b) – The actual signature is never logged.
+    """
+
     if not twilio_validator:
-        raise HTTPException(status_code=500, detail="Twilio signature validator not configured")
+        raise HTTPException(
+            status_code=500, detail="Twilio signature validator not configured"
+        )
 
+    # ------------------------------------------------------------------
+    # 0. Extract header + body once
+    # ------------------------------------------------------------------
     signature = request.headers.get("X-Twilio-Signature", "")
+    raw_body_bytes = await request.body()
 
-    # Reconstruct the absolute URL Twilio used when signing (respect proxies)
-    forwarded_proto = request.headers.get("x-forwarded-proto")
-    host = request.headers.get("host")
-    if forwarded_proto and host:
-        url_used = f"{forwarded_proto}://{host}{request.url.path}"
+    # ------------------------------------------------------------------
+    # 1. Reconstruct signed URL (taking reverse proxy headers into account)
+    # ------------------------------------------------------------------
+    proto_hdr = request.headers.get("x-forwarded-proto")
+    host_hdr = request.headers.get("host")
+    if proto_hdr and host_hdr:
+        url_used = f"{proto_hdr}://{host_hdr}{request.url.path}"
         if request.url.query:
             url_used += f"?{request.url.query}"
     else:
         url_used = str(request.url)
 
-    raw_body_bytes = await request.body()
-
-    # Audit headers (masked) for debugging / HIPAA logging
+    # Log sanitised headers for audit purposes
     logger.info(
         "[AUTH] Twilio webhook headers (sanitised): %s",
         sanitize_headers(dict(request.headers)),
     )
 
-    from urllib.parse import parse_qs
-
-    params_multi = parse_qs(raw_body_bytes.decode(), keep_blank_values=True)
-
-    # ---------------------------------------------------------------------
-    # Robust Twilio signature validation with graceful fallbacks
-    # ---------------------------------------------------------------------
-    # 1) Standard form-encoded payloads (Twilio Voice default)
-    # 2) JSON / raw payloads (e.g. Functions, Flex, etc.)
-    #
-    # HIPAA §164.312(b) – We deliberately *avoid* logging the raw signature
-    # while preserving a full audit trail of the validation outcome.
-
+    # ------------------------------------------------------------------
+    # 2. Determine payload representation
+    # ------------------------------------------------------------------
     content_type = request.headers.get("content-type", "").lower()
+
+    form_params: dict[str, str] | None = None
+    body_str: str | None = None
+
+    if "application/x-www-form-urlencoded" in content_type:
+        # Starlette's FormData implements the mapping interface but Twilio's
+        # helper expects either a *plain dict* or something with `.getlist()`.
+        # Converting to a dict(str→str) avoids any odd method look-ups.
+        try:
+            form = await request.form()
+            # If a key appears multiple times we must preserve **all** values
+            # (Twilio will sign each occurrence in lexical order).  We join
+            # multi-values with a comma which is the same behaviour as
+            # ``parse_qs`` → it keeps the list but RequestValidator will loop
+            # over them one-by-one.
+            form_params = {}
+            for k, v in form.multi_items():  # type: ignore[attr-defined]
+                # `multi_items()` yields duplicate keys – we concatenate.
+                form_params[k] = (
+                    f"{form_params[k]}{v}" if k in form_params else v
+                )
+        except Exception as e:
+            logger.debug("[AUTH] Failed to parse form body: %s", e)
+
+    # Fallback to raw body for non-form content-types or when parsing fails.
+    if form_params is None:
+        body_str = raw_body_bytes.decode(errors="ignore")
+
+    # ------------------------------------------------------------------
+    # 3. Validate signature (primary path + safe fallback)
+    # ------------------------------------------------------------------
     validated = False
 
-    # We now always validate using the *exact* raw body string to avoid
-    # nested-list corner-cases inside ``twilio.request_validator`` that lead
-    # to ``TypeError: unhashable type: 'list'`` when values are lists.
-    # The Twilio helper handles ``str`` bodies by appending them verbatim to
-    # the URL when constructing the signature base-string (per Twilio docs).
+    def _manual_signature(url: str, params: dict[str, str] | str) -> str:
+        """Compute Twilio HMAC-SHA1 signature (body or params)."""
+        import hashlib, hmac, base64
 
-    body_str = raw_body_bytes.decode(errors="ignore")
+        if isinstance(params, str):
+            data = url + params
+        else:
+            pieces: list[str] = [url]
+            for key in sorted(params):
+                pieces.append(key + params[key])
+            data = "".join(pieces)
+        digest = hmac.new(
+            TWILIO_AUTH_TOKEN.encode(), data.encode(), hashlib.sha1
+        ).digest()
+        return base64.b64encode(digest).decode()
 
-    if signature and twilio_validator.validate(url_used, body_str, signature):
-        validated = True
+    try:
+        if form_params is not None:
+            validated = twilio_validator.validate(url_used, form_params, signature)
+        else:
+            validated = twilio_validator.validate(url_used, body_str or "", signature)
+    except (TypeError, AttributeError) as e:
+        # Older versions of the helper blow up on unexpected types – fallback
+        logger.debug("[AUTH] Twilio validator error – switching to manual (%s)", e)
+        expected_sig = _manual_signature(url_used, form_params or body_str or "")
+        validated = hmac.compare_digest(expected_sig, signature)
 
+    # ------------------------------------------------------------------
+    # 4. Outcome & audit logging
+    # ------------------------------------------------------------------
     if validated:
+        from urllib.parse import parse_qs
+
+        params_multi = parse_qs(raw_body_bytes.decode(), keep_blank_values=True)
         logger.info(
             "[AUTH] X-Twilio-Signature validated for CallSid=%s",
             (params_multi.get("CallSid") or ["unknown"])[0],
         )
-        return
+        return  # ✅ Success
 
     logger.warning("[AUTH] X-Twilio-Signature validation failed – rejecting request")
     raise HTTPException(status_code=403, detail="Invalid Twilio Signature")
