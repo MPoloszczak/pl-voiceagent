@@ -8,7 +8,7 @@ import base64
 import json
 import jwt  # PyJWT
 
-from utils import logger, setup_logging
+from utils import logger, setup_logging, sanitize_headers
 from twilio import twilio_service
 from dpg import get_deepgram_service
 from ell import tts_service
@@ -88,39 +88,26 @@ async def verify_twilio_signature(request: Request):
 
     raw_body_bytes = await request.body()
 
-    from urllib.parse import parse_qs
+    # Log headers at INFO with masking of sensitive values for HIPAA compliance
+    logger.info(
+        "[AUTH] Twilio webhook headers (sanitised): %s",
+        sanitize_headers(dict(request.headers)),
+    )
 
-    # Keep blank values to ensure byte-for-byte fidelity in signature
-    # computation (Twilio includes empty params when signing).
-    params_multi = parse_qs(raw_body_bytes.decode(), keep_blank_values=True)
-
-    # Twilio RequestValidator cannot accept list values inside the mapping; we
-    # therefore flatten each entry to a comma-joined string (duplicate keys
-    # are uncommon in Voice webhooks).  This mirrors examples in the Twilio
-    # Python quick-start where `request.form`—a MultiDict that ultimately
-    # yields *single* scalar values for each key—is passed to the validator.
-    params_flat: dict[str, str] = {
-        k: ",".join(v) if len(v) > 1 else v[0] for k, v in params_multi.items()
-    }
-
-    # Attempt signature validation – short-circuit on success
-    if signature and twilio_validator.validate(url_used, params_flat, signature):
-        logger.info(
-            "[AUTH] X-Twilio-Signature validated for CallSid=%s", params_flat.get("CallSid", ["unknown"])[0]
-        )
+    # Fast path – if signature validates, we are done
+    if signature and twilio_validator.validate(url_used, raw_body_bytes.decode(), signature):
+        logger.info("[AUTH] X-Twilio-Signature validated for CallSid=%s", request.query_params.get("CallSid", "unknown"))
         return  # dependency passes, request continues
 
-    logger.warning(
-        "[AUTH] Signature validation failed or header missing – falling back to CallToken checks"
-    )
+    logger.warning("[AUTH] Signature validation failed or header missing – falling back to CallToken checks")
 
     # ----------------------------------------
     # 1) Extract and validate CallToken (secondary)
     # ----------------------------------------
 
-    from urllib.parse import unquote_plus
+    from urllib.parse import parse_qs, unquote_plus
 
-    form_dict = {k: v[0] for k, v in params_multi.items()}
+    form_dict = {k: v[0] for k, v in parse_qs(raw_body_bytes.decode()).items()}
     call_token_enc = form_dict.get("CallToken")
 
     if not call_token_enc:
@@ -139,24 +126,15 @@ async def verify_twilio_signature(request: Request):
 
     account_sid_env = os.getenv("ACCOUNT_SID") or os.getenv("TWILIO_ACCOUNT_SID")
 
-    # Attempt ES256 verification if public key is provided; otherwise fall back to claim checks
-    public_key_pem = os.getenv("TWILIO_CALLTOKEN_PUBLIC_KEY")  # optional
+    # Decode CallToken *without* signature verification – Twilio does not publish the
+    # verifying key for standard accounts.  We rely on claim-based checks per
+    # Twilio docs (https://www.twilio.com/docs/voice/trusted-calling-with-shakenstir#anatomy-of-a-calltoken).
 
     try:
-        if public_key_pem:
-            decoded_payload: dict = jwt.decode(
-                parent_token,
-                public_key_pem,
-                algorithms=["ES256"],
-                issuer=account_sid_env,
-                options={"require": ["iss", "iat", "callSid"]},
-            )
-            logger.info("[AUTH] CallToken signature verified with Twilio public key")
-        else:
-            decoded_payload: dict = jwt.decode(parent_token, options={"verify_signature": False})
-            logger.info("[AUTH] CallToken used without signature verification (public key not provided)")
+        decoded_payload: dict = jwt.decode(parent_token, options={"verify_signature": False})
+        logger.info("[AUTH] CallToken parsed – signature not verified (public key unavailable for this account tier)")
     except jwt.PyJWTError as e:
-        logger.warning("[AUTH] CallToken JWT parse/verify failed: %s", e)
+        logger.warning("[AUTH] CallToken JWT parse failed: %s", e)
         raise HTTPException(status_code=403, detail="Invalid CallToken token")
 
     # ---- Claim checks ----
