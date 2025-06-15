@@ -195,30 +195,23 @@ class TwilioService:
         logger.info(f"🔍 Request headers: {safe_headers}")
         logger.info(f"🔍 Detected host: {host}, scheme: {scheme}")
 
-        websocket_url = f"wss://{host}/twilio-stream"
-        if scheme == "http" and "localhost" in host:
-            # Only use ws:// for local development
-            websocket_url = f"ws://{host}/twilio-stream"
-
-        # Validate that auth credentials are available; if not, log a warning and
-        # fall back to unauthenticated WebSocket (Twilio will omit the header).
-        if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
-            logger.warning(
-                "[AUTH] TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set – WebSocket stream will be unauthenticated"
-            )
-
-        # Construct TwiML with (optional) Basic Auth credentials per Twilio docs:
         
-        auth_attrs = (
-            f' username="{TWILIO_ACCOUNT_SID}" password="{TWILIO_AUTH_TOKEN}"'
-            if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN
-            else ""
-        )
+        proto = "wss"  # Always secure per Twilio requirements
 
+        if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
+            error_msg = (
+                "[AUTH] TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set for authenticated WebSocket stream"
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        websocket_url = f"{proto}://{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}@{host}/twilio-stream"
+
+ 
         twiml = (
             f"""<Response>
     <Connect>
-        <Stream url="{websocket_url}" track="inbound_track"{auth_attrs} />
+        <Stream url="{websocket_url}" track="inbound_track" />
     </Connect>
 </Response>"""
         )
