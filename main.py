@@ -5,7 +5,6 @@ from aws_xray_sdk.core import patch_all
 import time
 from contextlib import asynccontextmanager
 import base64
-from twilio.request_validator import RequestValidator
 
 from utils import logger, setup_logging
 from twilio import twilio_service
@@ -38,8 +37,27 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 if not TWILIO_AUTH_TOKEN:
     logger.warning("TWILIO_AUTH_TOKEN is not set – Twilio signature validation will fail")
 
-twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+# Robust import of Twilio RequestValidator that works even when a local module named
+# `twilio` shadows the official package. Falls back to a manual loader.
+try:
+    from twilio.request_validator import RequestValidator  # type: ignore
+except ModuleNotFoundError:  # local twilio.py likely masked the package
+    import importlib.util as _ilu, importlib.machinery as _ilm
+    import pkg_resources as _pkgres, os as _os, sys as _sys
 
+    try:
+        _dist_path = _pkgres.get_distribution("twilio").location
+        _rv_path = _os.path.join(_dist_path, "twilio", "request_validator.py")
+        _spec = _ilu.spec_from_file_location("_twilio_request_validator", _rv_path)
+        _tmp_mod = _ilu.module_from_spec(_spec)  # type: ignore
+        assert _spec.loader is not None
+        _spec.loader.exec_module(_tmp_mod)  # type: ignore
+        RequestValidator = _tmp_mod.RequestValidator  # type: ignore
+        # defer logging until logger is available later
+        print("[AUTH] Loaded RequestValidator from site-packages fallback path")
+    except Exception as _e:
+        print(f"[AUTH] Failed to load Twilio RequestValidator: {_e}")
+        raise
 
 async def verify_twilio_signature(request: Request):
     """Dependency that validates the X-Twilio-Signature header."""
