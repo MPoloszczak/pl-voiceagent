@@ -71,10 +71,33 @@ async def verify_twilio_signature(request: Request):
         raise HTTPException(status_code=500, detail="Twilio signature validator not configured")
 
     # ----------------------------------------
-    # 1) Extract and validate CallToken (primary)
+    # 0) Check X-Twilio-Signature (preferred & always available)
     # ----------------------------------------
 
+    signature = request.headers.get("X-Twilio-Signature", "")
+
+    # Rebuild URL Twilio used (consider proxy headers)
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    host = request.headers.get("host")
+    if forwarded_proto and host:
+        url_used = f"{forwarded_proto}://{host}{request.url.path}"
+        if request.url.query:
+            url_used += f"?{request.url.query}"
+    else:
+        url_used = str(request.url)
+
     raw_body_bytes = await request.body()
+
+    # Fast path – if signature validates, we are done
+    if signature and twilio_validator.validate(url_used, raw_body_bytes.decode(), signature):
+        logger.info("[AUTH] X-Twilio-Signature validated for CallSid=%s", request.query_params.get("CallSid", "unknown"))
+        return  # dependency passes, request continues
+
+    logger.warning("[AUTH] Signature validation failed or header missing – falling back to CallToken checks")
+
+    # ----------------------------------------
+    # 1) Extract and validate CallToken (secondary)
+    # ----------------------------------------
 
     from urllib.parse import parse_qs, unquote_plus
 
@@ -98,26 +121,24 @@ async def verify_twilio_signature(request: Request):
     account_sid_env = os.getenv("ACCOUNT_SID") or os.getenv("TWILIO_ACCOUNT_SID")
 
     # Attempt ES256 verification if public key is provided; otherwise fall back to claim checks
-    public_key_pem = os.getenv("TWILIO_CALLTOKEN_PUBLIC_KEY")  # optional PEM string
+    public_key_pem = os.getenv("TWILIO_CALLTOKEN_PUBLIC_KEY")  # optional
 
-    decoded_payload: dict
     try:
         if public_key_pem:
-            decoded_payload = jwt.decode(
+            decoded_payload: dict = jwt.decode(
                 parent_token,
                 public_key_pem,
                 algorithms=["ES256"],
                 issuer=account_sid_env,
                 options={"require": ["iss", "iat", "callSid"]},
             )
-            logger.info("[AUTH] CallToken signature verified with supplied public key")
+            logger.info("[AUTH] CallToken signature verified with Twilio public key")
         else:
-            # Decode without verifying signature
-            decoded_payload = jwt.decode(parent_token, options={"verify_signature": False})
-            logger.warning("[AUTH] TWILIO_CALLTOKEN_PUBLIC_KEY not set – skipping signature verification")
+            decoded_payload: dict = jwt.decode(parent_token, options={"verify_signature": False})
+            logger.info("[AUTH] CallToken used without signature verification (public key not provided)")
     except jwt.PyJWTError as e:
-        logger.warning("[AUTH] CallToken JWT verification failed: %s", e)
-        raise HTTPException(status_code=403, detail="Invalid CallToken signature")
+        logger.warning("[AUTH] CallToken JWT parse/verify failed: %s", e)
+        raise HTTPException(status_code=403, detail="Invalid CallToken token")
 
     # ---- Claim checks ----
     import time
