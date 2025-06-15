@@ -247,16 +247,31 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 async def authorize_twilio_websocket(websocket: WebSocket) -> bool:
     """Rejects WebSocket connections that do not present valid Twilio Basic Auth."""
     auth_header = websocket.headers.get("Authorization", "")
+
+    # Verbose logging to diagnose 403s – **no PHI** in Basic creds (they are SID + token)
+    from utils import sanitize_headers
+    logger.info("[AUTH] WebSocket handshake headers: %s", sanitize_headers(dict(websocket.headers)))
+    logger.info("[AUTH] Authorization header raw value: %s", auth_header)
+
     if not auth_header.startswith("Basic "):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return False
 
+    # Decode and log components (token masked partially for security)
     try:
-        decoded = base64.b64decode(auth_header.split(" ")[1]).decode()
-        account_sid, token = decoded.split(":", 1)
-    except Exception:
+        decoded_creds = base64.b64decode(auth_header.split(" ")[1]).decode()
+        account_sid, token = decoded_creds.split(":", 1)
+        token_preview = token[:6] + "..." if len(token) > 6 else token
+        logger.info("[AUTH] Decoded Basic auth – SID=%s, token preview=%s", account_sid, token_preview)
+    except Exception as e:
+        logger.warning("[AUTH] Failed to decode Authorization header: %s", e)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return False
+
+    # We already decoded above; reuse variables
+    decoded = decoded_creds
+    account_sid = account_sid  # already
+    token = token
 
     if account_sid != TWILIO_ACCOUNT_SID or token != TWILIO_AUTH_TOKEN:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
