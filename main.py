@@ -88,20 +88,32 @@ async def verify_twilio_signature(request: Request):
 
     raw_body_bytes = await request.body()
 
-    # Fast path – if signature validates, we are done
-    if signature and twilio_validator.validate(url_used, raw_body_bytes.decode(), signature):
-        logger.info("[AUTH] X-Twilio-Signature validated for CallSid=%s", request.query_params.get("CallSid", "unknown"))
+
+
+    from urllib.parse import parse_qs
+
+    # Keep blank values to ensure byte-for-byte fidelity in signature
+    # computation (Twilio includes empty params when signing).
+    params_multi = parse_qs(raw_body_bytes.decode(), keep_blank_values=True)
+
+    # Attempt signature validation – short-circuit on success
+    if signature and twilio_validator.validate(url_used, params_multi, signature):
+        logger.info(
+            "[AUTH] X-Twilio-Signature validated for CallSid=%s", params_multi.get("CallSid", ["unknown"])[0]
+        )
         return  # dependency passes, request continues
 
-    logger.warning("[AUTH] Signature validation failed or header missing – falling back to CallToken checks")
+    logger.warning(
+        "[AUTH] Signature validation failed or header missing – falling back to CallToken checks"
+    )
 
     # ----------------------------------------
     # 1) Extract and validate CallToken (secondary)
     # ----------------------------------------
 
-    from urllib.parse import parse_qs, unquote_plus
+    from urllib.parse import unquote_plus
 
-    form_dict = {k: v[0] for k, v in parse_qs(raw_body_bytes.decode()).items()}
+    form_dict = {k: v[0] for k, v in params_multi.items()}
     call_token_enc = form_dict.get("CallToken")
 
     if not call_token_enc:
