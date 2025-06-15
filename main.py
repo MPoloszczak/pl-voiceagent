@@ -69,10 +69,26 @@ async def verify_twilio_signature(request: Request):
         raise HTTPException(status_code=500, detail="Twilio signature validator not configured")
 
     signature = request.headers.get("X-Twilio-Signature", "")
-    url = str(request.url)
-    body = await request.body()
 
-    if not twilio_validator.validate(url, body, signature):
+    # Reconstruct the exact URL Twilio hit, accounting for any TLS termination
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    host = request.headers.get("host")
+    if forwarded_proto and host:
+        url = f"{forwarded_proto}://{host}{request.url.path}"
+        if request.url.query:
+            url += f"?{request.url.query}"
+    else:
+        url = str(request.url)
+
+    # Twilio sends application/x-www-form-urlencoded payloads
+    try:
+        form = await request.form()
+    except Exception:
+        form = {}
+
+    params = {k: str(v) for k, v in dict(form).items()}
+
+    if not twilio_validator.validate(url, params, signature):
         logger.warning("[AUTH] Invalid Twilio webhook signature for %s", url)
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
