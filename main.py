@@ -59,6 +59,9 @@ except ModuleNotFoundError:  # local twilio.py likely masked the package
         print(f"[AUTH] Failed to load Twilio RequestValidator: {_e}")
         raise
 
+# Instantiate the validator once so dependency function can access it
+twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+
 async def verify_twilio_signature(request: Request):
     """Dependency that validates the X-Twilio-Signature header."""
     if not twilio_validator:
