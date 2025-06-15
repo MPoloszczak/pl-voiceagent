@@ -167,14 +167,18 @@ async def verify_twilio_signature(request: Request):
         ).digest()
         return base64.b64encode(digest).decode()
 
+    # 3a. Primary attempt using the official helper ----------------------------------------------------------------
     try:
         if form_params is not None:
             validated = twilio_validator.validate(url_used, form_params, signature)
         else:
             validated = twilio_validator.validate(url_used, body_str or "", signature)
     except (TypeError, AttributeError) as e:
-        # Older versions of the helper blow up on unexpected types – fallback
+        # ``twilio.request_validator`` threw – fall back to our own implementation.
         logger.debug("[AUTH] Twilio validator error – switching to manual (%s)", e)
+    
+    # 3b. If helper said *False* or raised, compute signature ourselves
+    if not validated and signature:
         expected_sig = _manual_signature(url_used, form_params or body_str or "")
         validated = hmac.compare_digest(expected_sig, signature)
 
