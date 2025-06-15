@@ -105,18 +105,16 @@ async def verify_twilio_signature(request: Request):
     content_type = request.headers.get("content-type", "").lower()
     validated = False
 
-    # --- Primary strategy: application/x-www-form-urlencoded --------------
-    if content_type.startswith("application/x-www-form-urlencoded"):
-        # Pass the *multi-value* dict directly so that the Twilio helper can
-        # correctly handle repeated parameters via `getlist`/`getall`.
-        if signature and twilio_validator.validate(url_used, params_multi, signature):
-            validated = True
+    # We now always validate using the *exact* raw body string to avoid
+    # nested-list corner-cases inside ``twilio.request_validator`` that lead
+    # to ``TypeError: unhashable type: 'list'`` when values are lists.
+    # The Twilio helper handles ``str`` bodies by appending them verbatim to
+    # the URL when constructing the signature base-string (per Twilio docs).
 
-    # --- Fallback strategy: treat body as opaque string --------------------
-    if not validated:
-        body_str = raw_body_bytes.decode()
-        if signature and twilio_validator.validate(url_used, body_str, signature):
-            validated = True
+    body_str = raw_body_bytes.decode(errors="ignore")
+
+    if signature and twilio_validator.validate(url_used, body_str, signature):
+        validated = True
 
     if validated:
         logger.info(
