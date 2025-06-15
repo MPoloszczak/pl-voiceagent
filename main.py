@@ -97,16 +97,30 @@ async def verify_twilio_signature(request: Request):
     raw_body_bytes = await request.body()
 
     # ------------------------------------------------------------------
-    # 1. Reconstruct signed URL (taking reverse proxy headers into account)
+    # Robust URL reconstruction respecting reverse-proxy headers (RFC 7239)
     # ------------------------------------------------------------------
-    proto_hdr = request.headers.get("x-forwarded-proto")
-    host_hdr = request.headers.get("host")
-    if proto_hdr and host_hdr:
-        url_used = f"{proto_hdr}://{host_hdr}{request.url.path}"
-        if request.url.query:
-            url_used += f"?{request.url.query}"
-    else:
-        url_used = str(request.url)
+    # Defaults fall back to what ASGI sees directly.
+    proto_hdr: str | None = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host_hdr: str | None = request.headers.get("x-forwarded-host") or request.headers.get("host")
+
+    # Parse consolidated Forwarded header when present: e.g.
+    #   Forwarded: by=3.235.38.83;for=50.17.120.24;host=clinicdev.pololabsai.com;proto=https
+    fwd_header = request.headers.get("forwarded")
+    if fwd_header:
+        for part in fwd_header.split(";"):
+            kv = part.strip().split("=", 1)
+            if len(kv) != 2:
+                continue
+            k, v = kv[0].lower(), kv[1]
+            if k == "proto" and v:
+                proto_hdr = v
+            elif k == "host" and v:
+                host_hdr = v
+
+    # Final assembled URL used for signature verification
+    url_used = f"{proto_hdr}://{host_hdr}{request.url.path}"
+    if request.url.query:
+        url_used += f"?{request.url.query}"
 
     # Log raw headers for in-depth debugging – includes the X-Twilio-Signature
     # NOTE: Twilio signature does **not** constitute ePHI; logging remains HIPAA-compliant (see 45 CFR §164.514(a)).
@@ -114,7 +128,8 @@ async def verify_twilio_signature(request: Request):
     logger.info("[AUTH] X-Twilio-Signature header value: %s", signature)
 
     # Additional context for troubleshooting
-    logger.info("[AUTH] Constructed URL for validation: %s", url_used)
+    logger.info("[AUTH] Forwarded header (raw): %s", fwd_header)
+    logger.info("[AUTH] Final URL chosen for signature validation: %s", url_used)
 
     # ------------------------------------------------------------------
     # 2. Determine payload representation
@@ -124,7 +139,7 @@ async def verify_twilio_signature(request: Request):
     logger.info("[AUTH] Content-Type header: %s", content_type)
     logger.info("[AUTH] Raw body length: %d bytes", len(raw_body_bytes))
 
-    form_params: dict[str, str] | None = None
+    form_params: dict[str, str | list[str]] | None = None
     body_str: str | None = None
 
     if "application/x-www-form-urlencoded" in content_type:
@@ -140,10 +155,16 @@ async def verify_twilio_signature(request: Request):
             # over them one-by-one.
             form_params = {}
             for k, v in form.multi_items():  # type: ignore[attr-defined]
-                # `multi_items()` yields duplicate keys – we concatenate.
-                form_params[k] = (
-                    f"{form_params[k]}{v}" if k in form_params else v
-                )
+                # Preserve duplicate keys as *lists* so that signature generation
+                # treats each occurrence individually, mirroring Twilio's official algorithm.
+                if k in form_params:
+                    existing = form_params[k]
+                    if isinstance(existing, list):
+                        existing.append(v)
+                    else:
+                        form_params[k] = [existing, v]
+                else:
+                    form_params[k] = v
         except Exception as e:
             logger.info("[AUTH] Failed to parse form body: %s", e)
 
@@ -171,7 +192,12 @@ async def verify_twilio_signature(request: Request):
         else:
             pieces: list[str] = [url]
             for key in sorted(params):
-                pieces.append(key + params[key])
+                val = params[key]
+                if isinstance(val, list):
+                    for single_val in val:
+                        pieces.append(key + str(single_val))
+                else:
+                    pieces.append(key + str(val))
             data = "".join(pieces)
         digest = hmac.new(
             TWILIO_AUTH_TOKEN.encode(), data.encode(), hashlib.sha1
