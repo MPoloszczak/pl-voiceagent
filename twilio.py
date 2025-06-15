@@ -207,16 +207,23 @@ class TwilioService:
                 "[AUTH] TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set – WebSocket stream will be unauthenticated"
             )
 
-        # Construct TwiML with Basic Auth credentials per Twilio docs:
-        # https://www.twilio.com/docs/voice/twiml/stream#security
-        twiml = f"""
-<Response>
-    <Connect>
-        <Stream url=\"{websocket_url}\" track=\"inbound_track\""" + (
-            f" username=\"{TWILIO_ACCOUNT_SID}\" password=\"{TWILIO_AUTH_TOKEN}\"" if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else ""
-        ) + "/>\n    </Connect>\n</Response>\n"""
+        # Construct TwiML with (optional) Basic Auth credentials per Twilio docs:
+        
+        auth_attrs = (
+            f' username="{TWILIO_ACCOUNT_SID}" password="{TWILIO_AUTH_TOKEN}"'
+            if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN
+            else ""
+        )
 
-        logger.debug(f"🔍 Generated TwiML response: {twiml}")
+        twiml = (
+            f"""<Response>
+    <Connect>
+        <Stream url="{websocket_url}" track="inbound_track"{auth_attrs} />
+    </Connect>
+</Response>"""
+        )
+
+        logger.debug("🔍 Generated TwiML response: %s", twiml)
 
         logger.info(f"Instructing Twilio to connect to WebSocket: {websocket_url}")
 
