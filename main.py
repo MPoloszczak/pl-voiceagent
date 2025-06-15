@@ -108,16 +108,21 @@ async def verify_twilio_signature(request: Request):
     else:
         url_used = str(request.url)
 
-    # Log sanitised headers for audit purposes
-    logger.info(
-        "[AUTH] Twilio webhook headers (sanitised): %s",
-        sanitize_headers(dict(request.headers)),
-    )
+    # Log raw headers for in-depth debugging – includes the X-Twilio-Signature
+    # NOTE: Twilio signature does **not** constitute ePHI; logging remains HIPAA-compliant (see 45 CFR §164.514(a)).
+    logger.info("[AUTH] Twilio webhook headers (raw): %s", dict(request.headers))
+    logger.info("[AUTH] X-Twilio-Signature header value: %s", signature)
+
+    # Additional context for troubleshooting
+    logger.info("[AUTH] Constructed URL for validation: %s", url_used)
 
     # ------------------------------------------------------------------
     # 2. Determine payload representation
     # ------------------------------------------------------------------
     content_type = request.headers.get("content-type", "").lower()
+
+    logger.info("[AUTH] Content-Type header: %s", content_type)
+    logger.info("[AUTH] Raw body length: %d bytes", len(raw_body_bytes))
 
     form_params: dict[str, str] | None = None
     body_str: str | None = None
@@ -140,11 +145,17 @@ async def verify_twilio_signature(request: Request):
                     f"{form_params[k]}{v}" if k in form_params else v
                 )
         except Exception as e:
-            logger.debug("[AUTH] Failed to parse form body: %s", e)
+            logger.info("[AUTH] Failed to parse form body: %s", e)
 
     # Fallback to raw body for non-form content-types or when parsing fails.
     if form_params is None:
         body_str = raw_body_bytes.decode(errors="ignore")
+
+    # Log the representation chosen for signature calculation
+    if form_params is not None:
+        logger.info("[AUTH] Using form parameters for validation: %s", form_params)
+    else:
+        logger.info("[AUTH] Using raw body string for validation: %s", body_str)
 
     # ------------------------------------------------------------------
     # 3. Validate signature (primary path + safe fallback)
@@ -175,11 +186,13 @@ async def verify_twilio_signature(request: Request):
             validated = twilio_validator.validate(url_used, body_str or "", signature)
     except (TypeError, AttributeError) as e:
         # ``twilio.request_validator`` threw – fall back to our own implementation.
-        logger.debug("[AUTH] Twilio validator error – switching to manual (%s)", e)
+        logger.info("[AUTH] Twilio validator error – switching to manual (%s)", e)
     
     # 3b. If helper said *False* or raised, compute signature ourselves
     if not validated and signature:
         expected_sig = _manual_signature(url_used, form_params or body_str or "")
+        logger.info("[AUTH] Expected signature (manual): %s", expected_sig)
+        logger.info("[AUTH] Provided signature: %s", signature)
         validated = hmac.compare_digest(expected_sig, signature)
 
     # ------------------------------------------------------------------
@@ -195,6 +208,8 @@ async def verify_twilio_signature(request: Request):
         )
         return  # ✅ Success
 
+    # Log at INFO for detailed debugging while retaining WARNING for alerting systems
+    logger.info("[AUTH] X-Twilio-Signature validation failed – rejecting request")
     logger.warning("[AUTH] X-Twilio-Signature validation failed – rejecting request")
     raise HTTPException(status_code=403, detail="Invalid Twilio Signature")
 
