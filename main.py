@@ -88,18 +88,25 @@ async def verify_twilio_signature(request: Request):
 
     raw_body_bytes = await request.body()
 
-
-
     from urllib.parse import parse_qs
 
     # Keep blank values to ensure byte-for-byte fidelity in signature
     # computation (Twilio includes empty params when signing).
     params_multi = parse_qs(raw_body_bytes.decode(), keep_blank_values=True)
 
+    # Twilio RequestValidator cannot accept list values inside the mapping; we
+    # therefore flatten each entry to a comma-joined string (duplicate keys
+    # are uncommon in Voice webhooks).  This mirrors examples in the Twilio
+    # Python quick-start where `request.form`—a MultiDict that ultimately
+    # yields *single* scalar values for each key—is passed to the validator.
+    params_flat: dict[str, str] = {
+        k: ",".join(v) if len(v) > 1 else v[0] for k, v in params_multi.items()
+    }
+
     # Attempt signature validation – short-circuit on success
-    if signature and twilio_validator.validate(url_used, params_multi, signature):
+    if signature and twilio_validator.validate(url_used, params_flat, signature):
         logger.info(
-            "[AUTH] X-Twilio-Signature validated for CallSid=%s", params_multi.get("CallSid", ["unknown"])[0]
+            "[AUTH] X-Twilio-Signature validated for CallSid=%s", params_flat.get("CallSid", ["unknown"])[0]
         )
         return  # dependency passes, request continues
 
