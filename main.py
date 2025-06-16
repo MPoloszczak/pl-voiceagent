@@ -129,9 +129,7 @@ async def verify_twilio_signature(request: Request):
     # 2. Determine payload representation
     # ------------------------------------------------------------------
     content_type = request.headers.get("content-type", "").lower()
-
-    logger.info("[AUTH] Content-Type header: %s", content_type)
-    logger.info("[AUTH] Raw body length: %d bytes", len(raw_body_bytes))
+    # [REMOVED] Detailed content type and body length logs to reduce PHI exposure
 
     form_params: dict[str, str | list[str]] | None = None
     body_str: str | None = None
@@ -223,10 +221,8 @@ async def verify_twilio_signature(request: Request):
         from urllib.parse import parse_qs
 
         params_multi = parse_qs(raw_body_bytes.decode(), keep_blank_values=True)
-        logger.info(
-            "[AUTH] X-Twilio-Signature validated for CallSid=%s",
-            (params_multi.get("CallSid") or ["unknown"])[0],
-        )
+        # [AUTH] Signature successfully validated
+        logger.info("[AUTH] X-Twilio-Signature validated")
         return  # ✅ Success
 
     # concise info no secret

@@ -70,7 +70,7 @@ class MCPSessionManager:
             "keep_alive": True
         }
         
-        HIPAALogger.log_mcp_access("session_created", "success", f"session_id={session_id}")
+        HIPAALogger.log_mcp_access("session_created", "success")
         return session_id
     
     def update_session_activity(self, session_id: str):
@@ -89,7 +89,7 @@ class MCPSessionManager:
         
         for session_id in expired_sessions:
             del self._sessions[session_id]
-            HIPAALogger.log_mcp_access("session_expired", "cleanup", f"session_id={session_id}")
+            HIPAALogger.log_mcp_access("session_expired", "cleanup")
     
     def get_session_headers(self, session_id: str) -> Dict[str, str]:
         """Get headers for MCP requests including client ID and session info."""
@@ -133,11 +133,11 @@ async def create_mcp_server() -> Optional[object]:
     try:
         # Validate URL for HIPAA compliance
         if not MCP_SERVER_URL.startswith(('https://', 'http://localhost')):
-            logger.error("[HIPAA-MCP] Invalid URL scheme: %s", MCP_SERVER_URL)
-            HIPAALogger.log_mcp_access("url_validation", "invalid_scheme", MCP_SERVER_URL)
+            logger.error("[HIPAA-MCP] Invalid MCP URL scheme")
+            HIPAALogger.log_mcp_access("url_validation", "invalid_scheme")
             return None
         
-        logger.info("[HIPAA-MCP] Creating MCP server connection to %s", MCP_SERVER_URL)
+        logger.info("[HIPAA-MCP] Creating MCP server connection")
         
         # Import OpenAI Agents SDK MCP classes - using latest 2025-03-26 compatible version
         from agents.mcp.server import MCPServerStreamableHttp
@@ -164,18 +164,17 @@ async def create_mcp_server() -> Optional[object]:
         )
         
         # Connect the server
-        logger.info("[HIPAA-MCP] Connecting to MCP server with client_id=%s session_id=%s", 
-                   _session_manager.get_client_id(), session_id)
+        logger.info("[HIPAA-MCP] Connecting to MCP server")
         await mcp_server.connect()
         
         # Verify connection by listing tools
         tools = await asyncio.wait_for(mcp_server.list_tools(), timeout=10.0)
-        logger.info("[HIPAA-MCP] MCP server connected successfully, found %d tools", len(tools))
+        logger.info("[HIPAA-MCP] MCP server connected successfully, tools discovered=%d", len(tools))
         
         # Cache the connected server
         _mcp_server_instance = mcp_server
         
-        HIPAALogger.log_mcp_access("server_created", "success", f"tools_{len(tools)}_client_id_{_session_manager.get_client_id()}")
+        HIPAALogger.log_mcp_access("server_created", "success", f"tools_{len(tools)}")
         return mcp_server
         
     except ImportError as e:

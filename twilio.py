@@ -165,7 +165,8 @@ class TwilioService:
                 media_type="application/xml",
             )
 
-        logger.info(f"Incoming call received: {call_sid}")
+        # Do not expose exact CallSid in logs
+        logger.info("Incoming call received")
 
         # Fire-and-forget warm-up of the OpenAI connection so that the first
         # agent response will not suffer a cold TLS/TCP handshake delay.
@@ -207,7 +208,8 @@ class TwilioService:
 
         logger.debug("🔍 Generated TwiML response: %s", twiml)
 
-        logger.info(f"Instructing Twilio to connect to WebSocket: {websocket_url}")
+        # Hide full WebSocket URL in logs to avoid exposing infrastructure details
+        logger.info("Instructing Twilio to connect to WebSocket")
 
         # Store CallSid after sending response – track connection attempts
         self.websocket_connection_attempts[call_sid] = []

@@ -9,6 +9,7 @@ import base64
 from typing import Dict
 import sys
 import boto3
+import re
 
 # Configure logging
 def setup_logging(app_name="pl-voiceagent"):
@@ -41,6 +42,35 @@ def setup_logging(app_name="pl-voiceagent"):
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
+
+   
+
+        class _RedactFilter(logging.Filter):
+            _callsid_re = re.compile(r"CA[a-fA-F0-9]{32}")  # Twilio CallSid pattern
+            _uuid_re = re.compile(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}")
+            _url_re = re.compile(r"https?://[^\s]+")
+
+            def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+                # Mutate the message *before* formatting; replace sensitive
+                # substrings with placeholders.
+                if isinstance(record.msg, str):
+                    new_msg = self._callsid_re.sub("[CALL_SID]", record.msg)
+                    new_msg = self._uuid_re.sub("[UUID]", new_msg)
+                    new_msg = self._url_re.sub("[URL]", new_msg)
+                    record.msg = new_msg
+                # Also scrub *args* in case formatting uses %s placeholders.
+                if record.args:
+                    scrubbed_args = []
+                    for arg in record.args:
+                        if isinstance(arg, str):
+                            arg = self._callsid_re.sub("[CALL_SID]", arg)
+                            arg = self._uuid_re.sub("[UUID]", arg)
+                            arg = self._url_re.sub("[URL]", arg)
+                        scrubbed_args.append(arg)
+                    record.args = tuple(scrubbed_args)
+                return True
+
+        handler.addFilter(_RedactFilter())
         logger.addHandler(handler)
 
     # Prevent duplicate log propagation to the root logger
