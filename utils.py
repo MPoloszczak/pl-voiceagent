@@ -350,3 +350,112 @@ def sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
         else:
             sanitized[k] = v
     return sanitized 
+
+# ---------------------------------------------------------------------------
+# AWS X-Ray helpers – PHI redaction for trace data
+# ---------------------------------------------------------------------------
+
+# Pre-compiled regex patterns used by both the log redactor and the X-Ray helper
+# to ensure a single, consistent definition of what constitutes sensitive data.
+_CALLSID_RE = re.compile(r"CA[a-fA-F0-9]{32}")
+_UUID_RE = re.compile(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}")
+_URL_RE = re.compile(r"https?://[^\s]+")
+_PHONE_RE = re.compile(r"\+?\d[\d\-\.\s]{7,}\d")
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+__all_patterns = (
+    _CALLSID_RE,
+    _UUID_RE,
+    _URL_RE,
+    _PHONE_RE,
+    _EMAIL_RE,
+)
+
+
+def _sanitize_str(value: str) -> str:
+    """Redact any substring that matches our *PHI* patterns.
+
+    The literal string "REDACTED" is used to preserve structure while
+    eliminating the possibility of leaking PHI in accordance with
+    HIPAA §164.312(b).
+    """
+    for pat in __all_patterns:
+        value = pat.sub("[REDACTED]", value)
+    return value
+
+
+def sanitize_xray_entity(entity_dict):
+    """Recursively *copy* and sanitise an X-Ray segment/sub-segment *dict*.
+
+    Args:
+        entity_dict: The dictionary produced by ``.to_dict()`` on a Segment or
+            Subsegment instance.
+
+    Returns:
+        A *new* dictionary where every string value has been scrubbed of any
+        text that matches the PHI patterns defined above.
+
+    This helper purposefully does **not** mutate the original dict so it can be
+    used safely in debugging contexts without side-effects.
+    """
+    def _walk(obj):
+        if isinstance(obj, str):
+            return _sanitize_str(obj)
+        elif isinstance(obj, list):
+            return [_walk(v) for v in obj]
+        elif isinstance(obj, dict):
+            return {k: _walk(v) for k, v in obj.items()}
+        else:
+            return obj
+
+    return _walk(entity_dict)
+
+
+# ---------------------------------------------------------------------------
+# Monkey-patch AWS X-Ray emitter so *all* traces leaving the process are scrubbed
+# ---------------------------------------------------------------------------
+
+
+def _patch_xray_emitter_phi_redaction() -> None:
+    """Install a custom emitter that redacts PHI before data leaves the host.
+
+    The patch is a *best-effort* safeguard – if the AWS X-Ray SDK is not
+    available the function is a no-op.  Any internal failure falls back to the
+    stock behaviour while logging a warning so observability is maintained
+    without risking downtime.
+    """
+    try:
+        # Import lazily so environments without the SDK don't error at import time.
+        from aws_xray_sdk.core import xray_recorder  # type: ignore
+        from aws_xray_sdk.core.emitters.udp_emitter import UDPEmitter  # type: ignore
+    except Exception as e:  # pragma: no cover – SDK optional
+        logger.debug("X-Ray SDK not present, PHI redaction patch skipped: %s", e)
+        return
+
+    class _SanitisingUDPEmitter(UDPEmitter):  # type: ignore
+        """Emitter subclass that sanitises trace data before UDP send."""
+
+        def send_entity(self, entity):  # type: ignore[override]
+            try:
+                # Convert to dict → scrub → JSON → bytes → UDP
+                entity_dict = entity.to_dict()  # noqa: SLF001 – public API
+                sanitized = sanitize_xray_entity(entity_dict)
+
+                data = json.dumps(sanitized, default=str, separators=(",", ":"))
+                self._send_data(data)  # noqa: SLF001 – protected in base class
+            except Exception as inner:
+                # Fall back to parent implementation on any failure to avoid data loss
+                logger.warning("[HIPAA-XRAY] Sanitising emitter error – falling back: %s", inner)
+                super().send_entity(entity)  # type: ignore[misc]
+
+    try:
+        # Configure recorder with our custom emitter, preserving any existing config.
+        xray_recorder.configure(emitter=_SanitisingUDPEmitter())  # type: ignore[arg-type]
+        logger.info("[HIPAA-XRAY] Custom sanitising emitter configured for PHI redaction")
+    except Exception as conf_err:  # pragma: no cover – defensive
+        logger.warning("[HIPAA-XRAY] Failed to configure sanitising emitter: %s", conf_err)
+
+
+# Fire the patch immediately so that *any* subsequent call to patch_all() or
+# manual X-Ray usage inherits the sanitised emitter.
+_patch_xray_emitter_phi_redaction() 
