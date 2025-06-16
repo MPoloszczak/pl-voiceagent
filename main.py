@@ -122,14 +122,8 @@ async def verify_twilio_signature(request: Request):
     if request.url.query:
         url_used += f"?{request.url.query}"
 
-    # Log raw headers for in-depth debugging – includes the X-Twilio-Signature
-    # NOTE: Twilio signature does **not** constitute ePHI; logging remains HIPAA-compliant (see 45 CFR §164.514(a)).
-    logger.info("[AUTH] Twilio webhook headers (raw): %s", dict(request.headers))
-    logger.info("[AUTH] X-Twilio-Signature header value: %s", signature)
-
-    # Additional context for troubleshooting
-    logger.info("[AUTH] Forwarded header (raw): %s", fwd_header)
-    logger.info("[AUTH] Final URL chosen for signature validation: %s", url_used)
+    # [REMOVED] Raw header and signature logging eliminated to prevent potential exposure of sensitive information.
+    logger.debug("[AUTH] Final URL chosen for signature validation")
 
     # ------------------------------------------------------------------
     # 2. Determine payload representation
@@ -219,8 +213,7 @@ async def verify_twilio_signature(request: Request):
     # 3b. If helper said *False* or raised, compute signature ourselves
     if not validated and signature:
         expected_sig = _manual_signature(url_used, form_params or body_str or "")
-        logger.info("[AUTH] Expected signature (manual): %s", expected_sig)
-        logger.info("[AUTH] Provided signature: %s", signature)
+        # [REMOVED] Detailed signature comparison logs eliminated to avoid sensitive data leakage.
         validated = hmac.compare_digest(expected_sig, signature)
 
     # ------------------------------------------------------------------
