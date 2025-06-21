@@ -65,6 +65,10 @@ def setup_logging(app_name="pl-voiceagent"):
                     new_msg = self._callsid_re.sub("[CALL_SID]", record.msg)
                     new_msg = self._uuid_re.sub("[UUID]", new_msg)
                     new_msg = self._url_re.sub("[URL]", new_msg)
+                    # Remove HIPAA audit/compliance tags from INFO/DEBUG logs
+                    if record.levelno in (logging.INFO, logging.DEBUG):
+                        new_msg = re.sub(r"\[HIPAA[^\]]*\]\s*", "", new_msg)
+                        new_msg = re.sub(r"HIPAA Compliance:\s*", "", new_msg)
                     record.msg = new_msg
                 # Also scrub *args* in case formatting uses %s placeholders.
                 if record.args:

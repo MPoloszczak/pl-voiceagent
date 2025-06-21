@@ -1,8 +1,0 @@
----
-description: 
-globs: 
-alwaysApply: true
----
-This application is fully hipaa compliant. The code, AWS Archeticture, Github Configuration, Data Transit, Encryption, etc should all be compliant under the most recent hipaa guidelines.
-
-Ensure to quote and cite the hipaa guidelines in your responses to ensure that we are keeping hipaa compliance.
