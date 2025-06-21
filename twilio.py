@@ -170,14 +170,6 @@ class TwilioService:
         # Do not expose exact CallSid in logs
         logger.info("Incoming call received")
 
-        # ------------------------------------------------------------------
-        # Start per-call duration tracker (await is cheap – single dict write)
-        # ------------------------------------------------------------------
-        try:
-            await start_call_length_timer(call_sid)
-        except Exception as e:
-            logger.debug(f"start_call_length_timer failed for {call_sid}: {e}")
-
         # Fire-and-forget warm-up of the OpenAI connection so that the first
         # agent response will not suffer a cold TLS/TCP handshake delay.
         # This costs zero tokens and completes while the welcome prompt plays.
@@ -314,6 +306,14 @@ class TwilioService:
 
                                 if call_sid:
                                     logger.debug("CallSid identified")
+
+                                    # Start per-call duration tracker now that we have the SID
+                                    try:
+                                        await start_call_length_timer(call_sid)
+                                    except Exception as e:
+                                        logger.debug(
+                                            f"start_call_length_timer failed for {call_sid}: {e}"
+                                        )
 
                                     # Store Stream SID for later use
                                     if stream_sid:
