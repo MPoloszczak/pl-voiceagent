@@ -28,12 +28,20 @@ def setup_logging(app_name="pl-voiceagent"):
 
     # Allow dynamic log level via environment variables. When REDIS_DEBUG or
     # DEBUG_SECRETS is enabled we default to DEBUG; otherwise honour LOG_LEVEL
-    # or default INFO.
+    # or default INFO.  If LOG_LEVEL is not explicitly set we force INFO so
+    # that info-level audit events are always visible.
     if os.getenv("DEBUG_SECRETS") == "1":
         level = logging.DEBUG
     else:
-        level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-        level = getattr(logging, level_name, logging.INFO)
+        level_name = os.getenv("LOG_LEVEL")
+        if level_name is None:
+            level = logging.INFO
+        else:
+            level = getattr(logging, level_name.upper(), logging.INFO)
+
+    # Ensure the chosen level is at least INFO so audit logs are not hidden.
+    if level > logging.INFO:
+        level = logging.INFO
 
     logger.setLevel(level)
 
@@ -470,7 +478,7 @@ _patch_xray_emitter_phi_redaction()
 _call_length_start_ts: Dict[str, float] = {}
 
 
-def start_call_length_timer(call_sid: str) -> None:
+async def start_call_length_timer(call_sid: str) -> None:
     """Mark *call_sid* as having started now for duration tracking.
 
     This helper should be invoked as soon as Twilio notifies the application
@@ -491,7 +499,7 @@ def start_call_length_timer(call_sid: str) -> None:
     logger.info("[HIPAA-AUDIT] call_length_timer_started call_sid=%s", call_sid)
 
 
-def stop_call_length_timer(call_sid: str) -> None:
+async def stop_call_length_timer(call_sid: str) -> None:
     """Stop the timer for *call_sid* and emit a duration log in MM:SS format.
 
     This should be called once the call is unequivocally finished – e.g. after
