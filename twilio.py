@@ -20,6 +20,8 @@ from utils import (
     cancel_keepalive_if_needed,
     enforce_call_length_limit,
     sanitize_headers,
+    start_call_length_timer,
+    stop_call_length_timer,
 )
 from dpg import get_deepgram_service
 from ell import tts_service
@@ -167,6 +169,14 @@ class TwilioService:
 
         # Do not expose exact CallSid in logs
         logger.info("Incoming call received")
+
+        # ------------------------------------------------------------------
+        # Start per-call duration tracker (await is cheap – single dict write)
+        # ------------------------------------------------------------------
+        try:
+            await start_call_length_timer(call_sid)
+        except Exception as e:
+            logger.debug(f"start_call_length_timer failed for {call_sid}: {e}")
 
         # Fire-and-forget warm-up of the OpenAI connection so that the first
         # agent response will not suffer a cold TLS/TCP handshake delay.
@@ -674,6 +684,13 @@ class TwilioService:
                 del self.silence_tasks[call_sid]
                 self.last_user_input.pop(call_sid, None)
                 self.silence_prompted.pop(call_sid, None)
+
+            # ---- Per-call duration logging ----
+            if call_sid:
+                try:
+                    await stop_call_length_timer(call_sid)
+                except Exception as e:
+                    logger.debug(f"stop_call_length_timer failed for {call_sid}: {e}")
 
             # ---- Call length timer cleanup ----
             if call_sid in self.call_length_tasks:
