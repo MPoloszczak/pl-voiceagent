@@ -459,3 +459,60 @@ def _patch_xray_emitter_phi_redaction() -> None:
 # Fire the patch immediately so that *any* subsequent call to patch_all() or
 # manual X-Ray usage inherits the sanitised emitter.
 _patch_xray_emitter_phi_redaction() 
+
+# ---------------------------------------------------------------------------
+# Per-call length tracking – audit duration once the call ends
+# ---------------------------------------------------------------------------
+
+# Internal mapping of Call SID → monotonic start timestamp.  We purposely use
+# ``time.monotonic()`` so that the calculation is immune to wall-clock changes
+# (e.g. NTP adjustments).
+_call_length_start_ts: Dict[str, float] = {}
+
+
+def start_call_length_timer(call_sid: str) -> None:
+    """Mark *call_sid* as having started now for duration tracking.
+
+    This helper should be invoked as soon as Twilio notifies the application
+    that a call has been initiated (e.g. at the moment a new WebSocket is
+    opened or the voice webhook is hit).
+
+    HIPAA §164.312(b) – Audit Controls: we log the timer start so that the
+    complete lifetime of the call can be reconstructed during any audit.
+    """
+    if call_sid in _call_length_start_ts:
+        # Duplicate start – this can legitimately happen if multiple
+        # components attempt to start the timer.  We keep the earliest value
+        # and only emit a debug-level message to avoid log noise.
+        logger.debug("start_call_length_timer already called for %s", call_sid)
+        return
+
+    _call_length_start_ts[call_sid] = time.monotonic()
+    logger.info("[HIPAA-AUDIT] call_length_timer_started call_sid=%s", call_sid)
+
+
+def stop_call_length_timer(call_sid: str) -> None:
+    """Stop the timer for *call_sid* and emit a duration log in MM:SS format.
+
+    This should be called once the call is unequivocally finished – e.g. after
+    the Twilio WebSocket disconnects, the Deepgram connection is closed, or
+    any other deterministic end-of-call trigger.
+
+    The function is *idempotent*: repeated invocations for the same *call_sid*
+    after the first will be ignored to avoid double-logging.
+    """
+    start_ts = _call_length_start_ts.pop(call_sid, None)
+    if start_ts is None:
+        # Either start was never recorded or this call has already been
+        # stopped.  We emit debug instead of warning to avoid unnecessary
+        # alerts in normal race conditions.
+        logger.debug("stop_call_length_timer called with unknown call_sid=%s", call_sid)
+        return
+
+    duration_sec = int(time.monotonic() - start_ts)
+    mm_ss = f"{duration_sec // 60:02}:{duration_sec % 60:02}"
+
+    # HIPAA Compliance: The duration itself is not PHI. Logging at INFO level
+    # with the call SID satisfies §164.312(b) audit requirement while not
+    # exposing sensitive content.
+    logger.info("[HIPAA-AUDIT] call_completed call_sid=%s duration=%s", call_sid, mm_ss) 
