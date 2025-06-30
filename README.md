@@ -40,44 +40,26 @@ Everything runs inside a single FastAPI process (Python 3.11) that exposes two p
 ---
 
 ## 2  High-level architecture
-```
+```mermaid
 flowchart LR
--  Caller(("Caller")) -- PSTN --> Twilio
--  Twilio -- Webhook --> API[/FastAPI /voice/]
--  API -- returns TwiML --> Twilio
--  Twilio -- 8 kHz µ-law WebSocket --> Stream[TwilioService /twilio-stream]
--  Stream -->|raw audio| Deepgram[DeepgramService\n(ASR)]
--  Deepgram -- transcript --> Agent[oai.py\nOpenAI Agent]
--  Agent -- text reply --> TTS[EllvenLabs TTSService]
--  TTS -- µ-law audio --> Stream
--  Stream -- media packets --> Twilio
--  Twilio -- PSTN --> Caller
--
--  subgraph Runtime
--    Stream
--    Deepgram
--    Agent
--    TTS
--    Cache[Redis Cache]
--  end
-+    Caller["Caller"] -->|"PSTN"| Twilio["Twilio"]
-+    Twilio -->|"Webhook"| API["FastAPI /voice"]
-+    API -->|"TwiML"| Twilio
-+    Twilio -->|"8 kHz μ-law WS"| Stream["TwilioService /twilio-stream"]
-+    Stream -->|"raw audio"| Deepgram["DeepgramService<br/>(ASR)"]
-+    Deepgram -->|"transcript"| Agent["OpenAI Agent"]
-+    Agent -->|"text reply"| TTS["TTSService"]
-+    TTS -->|"μ-law audio"| Stream
-+    Stream -->|"media packets"| Twilio
-+    Twilio -->|"PSTN"| Caller
-+
-+    subgraph "Runtime"
-+        Stream
-+        Deepgram
-+        Agent
-+        TTS
-+        Cache["Redis Cache"]
-+    end
+    Caller["Caller"] -- "PSTN" --> Twilio["Twilio"]
+    Twilio -- "Webhook" --> API["FastAPI /voice"]
+    API -- "TwiML" --> Twilio
+    Twilio -- "8 kHz mu-law WS" --> Stream["TwilioService /twilio-stream"]
+    Stream -- "raw audio" --> Deepgram["DeepgramService<br/>(ASR)"]
+    Deepgram -- "transcript" --> Agent["OpenAI Agent"]
+    Agent -- "text reply" --> TTS["TTSService"]
+    TTS -- "mu-law audio" --> Stream
+    Stream -- "media packets" --> Twilio
+    Twilio -- "PSTN" --> Caller
+
+    subgraph "Runtime"
+        Stream
+        Deepgram
+        Agent
+        TTS
+        Cache["Redis Cache"]
+    end
 ```
 
 ### Component map
