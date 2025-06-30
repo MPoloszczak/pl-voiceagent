@@ -23,3 +23,5 @@ mcp_source
 .cursor
 
 server
+
+docker-compose.yml
