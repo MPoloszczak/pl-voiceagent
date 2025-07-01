@@ -201,5 +201,3 @@ Pull requests welcome!  Please ensure new code:
 
 ---
 
-## 12  License
-© 2024 PoloLabs – MIT License. 
